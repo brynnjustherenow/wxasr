@@ -6,7 +6,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
 
 fn names(devices: impl Iterator<Item = Device>) -> Result<Vec<String>> {
-    devices.map(|d| d.name().map_err(|e| Error::Device(e.to_string()))).collect()
+    devices
+        .map(|d| d.name().map_err(|e| Error::Device(e.to_string())))
+        .collect()
 }
 
 fn find_named(mut devices: impl Iterator<Item = Device>, name: &str) -> Option<Device> {
@@ -53,13 +55,23 @@ impl To16k {
 }
 
 /// 在设备上建立输入流并播放（采集即开始）
-fn spawn_input(dev: &Device, cfg: &StreamConfig, fmt: SampleFormat, sink: PcmSink) -> Result<Stream> {
+fn spawn_input(
+    dev: &Device,
+    cfg: &StreamConfig,
+    fmt: SampleFormat,
+    sink: PcmSink,
+) -> Result<Stream> {
     let (rate, ch) = (cfg.sample_rate.0, cfg.channels);
     let err = |e: cpal::StreamError| eprintln!("[wxasr-provider] 音频流错误: {e}");
     let stream = match fmt {
         SampleFormat::F32 => {
             let mut c = To16k::new(rate, ch, sink);
-            dev.build_input_stream(cfg, move |d: &[f32], _| c.feed(d.iter().copied()), err, None)
+            dev.build_input_stream(
+                cfg,
+                move |d: &[f32], _| c.feed(d.iter().copied()),
+                err,
+                None,
+            )
         }
         SampleFormat::I16 => {
             let mut c = To16k::new(rate, ch, sink);
@@ -82,7 +94,9 @@ fn spawn_input(dev: &Device, cfg: &StreamConfig, fmt: SampleFormat, sink: PcmSin
         other => return Err(Error::Unsupported(format!("样本格式 {other:?}"))),
     }
     .map_err(|e| Error::Device(format!("建立输入流失败: {e}")))?;
-    stream.play().map_err(|e| Error::Device(format!("启动音频流失败: {e}")))?;
+    stream
+        .play()
+        .map_err(|e| Error::Device(format!("启动音频流失败: {e}")))?;
     Ok(stream)
 }
 
@@ -107,7 +121,9 @@ impl AudioSource for Microphone {
     }
 
     fn devices(&self) -> Result<Vec<String>> {
-        let devices = cpal::default_host().input_devices().map_err(|e| Error::Device(e.to_string()))?;
+        let devices = cpal::default_host()
+            .input_devices()
+            .map_err(|e| Error::Device(e.to_string()))?;
         names(devices)
     }
 
@@ -115,14 +131,19 @@ impl AudioSource for Microphone {
         let host = cpal::default_host();
         let dev = match device {
             Some(name) => {
-                let devices = host.input_devices().map_err(|e| Error::Device(e.to_string()))?;
-                find_named(devices, name).ok_or_else(|| Error::Device(format!("找不到麦克风: {name}")))?
+                let devices = host
+                    .input_devices()
+                    .map_err(|e| Error::Device(e.to_string()))?;
+                find_named(devices, name)
+                    .ok_or_else(|| Error::Device(format!("找不到麦克风: {name}")))?
             }
             None => host
                 .default_input_device()
                 .ok_or_else(|| Error::Device("没有可用的输入设备".to_string()))?,
         };
-        let cfg = dev.default_input_config().map_err(|e| Error::Device(format!("读取输入配置失败: {e}")))?;
+        let cfg = dev
+            .default_input_config()
+            .map_err(|e| Error::Device(format!("读取输入配置失败: {e}")))?;
         let fmt = cfg.sample_format();
         let stream = spawn_input(&dev, &cfg.into(), fmt, sink)?;
         Ok(Capture::new(stream))
@@ -151,15 +172,20 @@ impl DesktopAudio {
         let host = cpal::default_host();
         let dev = match device {
             Some(name) => {
-                let devices = host.output_devices().map_err(|e| Error::Device(e.to_string()))?;
-                find_named(devices, name).ok_or_else(|| Error::Device(format!("找不到输出设备: {name}")))?
+                let devices = host
+                    .output_devices()
+                    .map_err(|e| Error::Device(e.to_string()))?;
+                find_named(devices, name)
+                    .ok_or_else(|| Error::Device(format!("找不到输出设备: {name}")))?
             }
             None => host
                 .default_output_device()
                 .ok_or_else(|| Error::Device("没有可用的输出设备".to_string()))?,
         };
         // loopback：以输出设备的混音格式在其上建立输入流
-        let cfg = dev.default_output_config().map_err(|e| Error::Device(format!("读取输出配置失败: {e}")))?;
+        let cfg = dev
+            .default_output_config()
+            .map_err(|e| Error::Device(format!("读取输出配置失败: {e}")))?;
         let fmt = cfg.sample_format();
         let stream = spawn_input(&dev, &cfg.into(), fmt, sink)?;
         Ok(Capture::new(stream))
@@ -168,14 +194,20 @@ impl DesktopAudio {
     #[cfg(not(target_os = "windows"))]
     fn start_impl(&self, device: Option<&str>, sink: PcmSink) -> Result<Capture> {
         let host = cpal::default_host();
-        let inputs: Vec<Device> = host.input_devices().map_err(|e| Error::Device(e.to_string()))?.collect();
+        let inputs: Vec<Device> = host
+            .input_devices()
+            .map_err(|e| Error::Device(e.to_string()))?
+            .collect();
         let dev = match device {
-            Some(name) => {
-                find_named(inputs.into_iter(), name).ok_or_else(|| Error::Device(format!("找不到设备: {name}")))?
-            }
+            Some(name) => find_named(inputs.into_iter(), name)
+                .ok_or_else(|| Error::Device(format!("找不到设备: {name}")))?,
             None => inputs
                 .iter()
-                .find(|d| d.name().map(|n| n.to_lowercase().contains("monitor")).unwrap_or(false))
+                .find(|d| {
+                    d.name()
+                        .map(|n| n.to_lowercase().contains("monitor"))
+                        .unwrap_or(false)
+                })
                 .cloned()
                 .or_else(|| host.default_input_device())
                 .ok_or_else(|| {
@@ -185,7 +217,9 @@ impl DesktopAudio {
                     )
                 })?,
         };
-        let cfg = dev.default_input_config().map_err(|e| Error::Device(format!("读取输入配置失败: {e}")))?;
+        let cfg = dev
+            .default_input_config()
+            .map_err(|e| Error::Device(format!("读取输入配置失败: {e}")))?;
         let fmt = cfg.sample_format();
         let stream = spawn_input(&dev, &cfg.into(), fmt, sink)?;
         Ok(Capture::new(stream))
@@ -200,14 +234,16 @@ impl AudioSource for DesktopAudio {
     fn devices(&self) -> Result<Vec<String>> {
         #[cfg(target_os = "windows")]
         {
-            let devices =
-                cpal::default_host().output_devices().map_err(|e| Error::Device(e.to_string()))?;
+            let devices = cpal::default_host()
+                .output_devices()
+                .map_err(|e| Error::Device(e.to_string()))?;
             names(devices)
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let devices =
-                cpal::default_host().input_devices().map_err(|e| Error::Device(e.to_string()))?;
+            let devices = cpal::default_host()
+                .input_devices()
+                .map_err(|e| Error::Device(e.to_string()))?;
             names(devices)
         }
     }

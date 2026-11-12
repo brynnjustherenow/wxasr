@@ -2,7 +2,6 @@
 bench/
 model/
 pack/
-*.lock
 **/tests/data/
 *.txt
 PLAN.md

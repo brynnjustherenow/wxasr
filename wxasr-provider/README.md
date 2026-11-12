@@ -40,7 +40,7 @@ cargo run --release --example desktop_txt -- <模型目录> out.txt `
 ```
 
 `desktop_txt` 捕获的是整个系统混音——机器上同时在放的音乐/视频
-也会被转写进去（这正是 loopback 的语义）。
+也会被转写进去。
 
 ## 实测（Windows / WASAPI）
 
