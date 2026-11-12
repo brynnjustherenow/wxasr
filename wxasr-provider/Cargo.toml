@@ -1,0 +1,20 @@
+[package]
+name = "wxasr-provider"
+version = "0.1.0"
+edition = "2021"
+description = "wxasr 的跨平台音频采集提供者：麦克风与桌面回环，统一产出 16kHz 单声道 i16 PCM"
+license = "MIT"
+
+[dependencies]
+cpal = "0.15"
+thiserror = "2"
+
+[dev-dependencies]
+wxasr = { path = "../wxasr" }
+wxasr-async = { path = "../wxasr-async" }
+hound = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

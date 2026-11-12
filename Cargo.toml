@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "wxasr",
+    "wxasr-async",
+    'wxasr-provider'
+]

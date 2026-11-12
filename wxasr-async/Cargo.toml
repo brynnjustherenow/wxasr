@@ -1,0 +1,22 @@
+[package]
+name = "wxasr-async"
+version = "0.1.0"
+edition = "2021"
+description = "wxasr 的异步事件流封装：专用识别线程 + tokio mpsc，静音断句与中间结果节流"
+license = "MIT"
+
+[dependencies]
+wxasr = { path = "../wxasr" }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+hound = "3"
+
+# 数值计算在 wxasr 里，让依赖在 debug 测试下也可用
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

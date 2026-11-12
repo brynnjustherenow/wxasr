@@ -1,0 +1,23 @@
+[package]
+name = "wxasr"
+version = "0.1.0"
+edition = "2021"
+description = "微信输入法离线 ASR（.xnet 模型）纯 Rust 推理库"
+license = "MIT"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1"
+thiserror = "2"
+hound = "3"
+
+[dev-dependencies]
+memmap2 = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# 数值计算密集：让 `cargo test`（debug）也可用
+[profile.dev]
+opt-level = 2
