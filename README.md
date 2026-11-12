@@ -8,7 +8,8 @@ int8 动态量化 GEMM 自带 AVX2 内核，Windows/Linux/macOS/Android 均可�
 - **一次性转写**：`Model::transcribe_wav` 整段解码（16kHz 单声道 16bit wav）
 - **伪流式识别**：`Model::stream` 边说边出中间结果，已定稿前缀不变
 - **低资源占用**：权重 mmap 零拷贝加载（~5ms），int8 推理，4 线程封顶
-
+- **异步流支持**：`wxasr_async::start`返回`(AsrHandle, mpsc::Receiver<AsrEvent>)`
+- **跨平台音源**：**仅在windows上**进行了测试
 ## 实测（i7 / Windows / release）
 
 | 场景 | 结果 |
@@ -20,8 +21,7 @@ int8 动态量化 GEMM 自带 AVX2 内核，Windows/Linux/macOS/Android 均可�
 
 ## 模型文件
 
-本库不提供、也不指向任何模型下载来源。请自行获取微信输入法的离线语音包
-,解出以下两个文件放入同一目录：
+本库不提供、也不指向任何模型下载来源。请自行获取微信输入法的离线语音包,解出以下两个文件放入同一目录：
 
 ```
 model/
@@ -41,20 +41,19 @@ let partial = s.partial();                      // 中间结果（按 s.fresh() 
 let final_text = s.finish();                    // 定稿
 ```
 
-命令行转写：`cargo run --release --example cli -- <模型目录> a.wav`
-模型分析：`cargo run --release --example dump -- <模型目录>`
 
-## 工具
+## Example
 
 ```powershell
-# loopback 通路探测（播放 440Hz 3 秒并统计采集）
-cargo run --release --example probe -- 3
-
+# cd wxasr-provider
 # 桌面音频 → 识别 → 每句一行 txt（--play 自测用，会播放指定 wav）
 cargo run --release --example desktop_txt -- <模型目录> out.txt `
     --play ../wxasr/tests/data/tts_short_1.wav --secs 15
-```
 
+# cli工具，实时监听桌面音频，每次断句println(目前按静默300ms断句，有背景音效时不会触发断句。后续会支持自定义断句策略)
+cargo run --release --example live_desktop -- [模型目录]
+
+```
 `desktop_txt` 捕获的是整个系统混音——机器上同时在放的音乐/视频
 也会被转写进去。
 模型目录默认取 `WXASR_MODEL` 环境变量，缺省 `./model`。
@@ -65,7 +64,7 @@ cargo run --release --example desktop_txt -- <模型目录> out.txt `
 project/
 ├── wxasr               推理与伪流式解析
 ├── wxasr-async         异步封装的wxasr
-└── wxasr-provider      音频源定义与实现
+└── wxasr-provider      跨平台音频源定义与实现
 ```
 
 
