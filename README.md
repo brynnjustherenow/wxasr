@@ -38,6 +38,7 @@ let text = model.transcribe_wav("a.wav")?;      // 一次性转写
 let mut s = model.stream();                     // 流式
 s.push(&pcm);                                   // 16kHz 单声道 i16，任意块
 let partial = s.partial();                      // 中间结果（按 s.fresh() 节流）
+let (t, s) = s.rotate();                        // 定稿并接续：携带左文/未定稿尾部（长会话轮换）
 let final_text = s.finish();                    // 定稿
 ```
 
@@ -46,11 +47,11 @@ let final_text = s.finish();                    // 定稿
 
 ```powershell
 # cd wxasr-provider
-# 桌面音频 → 识别 → 每句一行 txt（--play 自测用，会播放指定 wav）
+# 桌面音频 → 识别 → 每段定稿一行 txt（--play 自测用，会播放指定 wav）
 cargo run --release --example desktop_txt -- <模型目录> out.txt `
     --play ../wxasr/tests/data/tts_short_1.wav --secs 15
 
-# cli工具，实时监听桌面音频，每次断句println(目前按静默300ms断句，有背景音效时不会触发断句。后续会支持自定义断句策略)
+# cli工具，实时监听桌面音频：💬 当前段实时刷新，上下文轮换时 ✅ 定稿换行（轮换时机由 RotatePolicy 决定，默认 15s 后遇静音 / 20s 强制，可自定义）
 cargo run --release --example live_desktop -- [模型目录]
 
 ```

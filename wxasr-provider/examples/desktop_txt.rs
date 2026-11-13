@@ -1,4 +1,4 @@
-//! 桌面音频采集 → 识别 → 每句一行写入 txt。
+//! 桌面音频采集 → 识别 → 每段定稿一行写入 txt。
 //!
 //! 用法：
 //! ```
@@ -122,8 +122,9 @@ async fn main() {
             .map_or(15, |p| p.total as u64 / p.rate as u64 + 3)
     });
 
-    println!("采集中 {secs}s（断句自动分行）…");
+    println!("采集中 {secs}s（每段定稿自动分行）…");
     let t0 = Instant::now();
+    // 每段定稿一行；Partial 是当前段的中间结果
     let mut lines: Vec<String> = Vec::new();
     let mut stopped = false;
     let mut asr_fin = Some(asr);
@@ -131,19 +132,12 @@ async fn main() {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(ev)) => match ev {
                 AsrEvent::Partial(p) => println!("… {p}"),
-                AsrEvent::Sentence(s) => {
-                    println!("句: {s}");
-                    lines.push(s);
-                }
                 AsrEvent::Final(f) => {
-                    if !f.is_empty() {
-                        println!("尾: {f}");
-                        lines.push(f);
-                    }
-                    break;
+                    println!("段: {f}");
+                    lines.push(f);
                 }
             },
-            Ok(None) => break, // 通道关闭
+            Ok(None) => break, // 通道关闭：会话结束
             Err(_) => {}     // 超时继续轮询
         }
         if !stopped && t0.elapsed().as_secs() >= secs {
@@ -156,5 +150,5 @@ async fn main() {
     }
     capture.stop();
     std::fs::write(&out_path, lines.join("\n") + "\n").expect("写文件失败");
-    println!("\n共 {} 句，已写入 {out_path}", lines.len());
+    println!("\n共 {} 段，已写入 {out_path}", lines.len());
 }
