@@ -45,7 +45,7 @@ cargo run --release --example desktop_txt -- <模型目录> out.txt `
 ## 实测（Windows / WASAPI）
 
 - loopback：48kHz 8ch f32 采集速率精确匹配播放（384000 样本/s）
-- E2E：播放 TTS → loopback 采集 → 识别 → 断句写 txt，
+- E2E：播放 TTS → loopback 采集 → 识别 → 转写写 txt，
   播放内容在中间结果中逐字浮现；背景音与播放内容同被捕获
 
 MIT License

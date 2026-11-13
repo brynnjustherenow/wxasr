@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use wxasr::Model;
-use wxasr_async::{start, AsrEvent, Config};
+use wxasr_async::{start, policy::RotatePolicy, AsrEvent, Config};
 
 fn load_model() -> Option<Arc<Model>> {
     let dir = std::env::var("WXASR_MODEL")
@@ -62,17 +62,24 @@ fn cer(reference: &str, hypothesis: &str) -> f64 {
     dp[r.len()][h.len()] as f64 / r.len() as f64
 }
 
-/// 收集事件直到 Final
+/// 收集事件直到通道关闭（会话结束）
 async fn drain(mut rx: tokio::sync::mpsc::Receiver<AsrEvent>) -> Vec<AsrEvent> {
     let mut out = Vec::new();
     while let Some(ev) = rx.recv().await {
-        let is_final = matches!(ev, AsrEvent::Final(_));
         out.push(ev);
-        if is_final {
-            break;
-        }
     }
     out
+}
+
+/// 按顺序拼接所有 Final，得到完整转写
+fn transcript(events: &[AsrEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AsrEvent::Final(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -96,15 +103,8 @@ async fn fast_feed_yields_final() {
     let events = tokio::time::timeout(Duration::from_secs(60), drain(rx))
         .await
         .expect("超时");
-    // 文本可能因尾静音以 Sentence 定稿、剩余部分进 Final，拼接后对拍
-    let got: String = events
-        .iter()
-        .filter_map(|e| match e {
-            AsrEvent::Sentence(t) | AsrEvent::Final(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect();
-    println!("拼接结果: {got}");
+    let got = transcript(&events);
+    println!("定稿结果: {got}");
     assert!(!got.is_empty(), "应有定稿文本，事件: {events:?}");
     assert!(
         cer(&text, &got) < 0.1,
@@ -113,24 +113,34 @@ async fn fast_feed_yields_final() {
     );
 }
 
+/// 三段语音（每段 >5s）间插 1.6s 静音：软上限 3s 意味着第 1、2 段后的
+/// 停顿必然触发静音轮换，各产生一个 Final（第 3 段由 finish 定稿）。
+/// 拼接所有 Final 与三段参考对拍，验证轮换定稿不丢字、拼接无缝。
 #[tokio::test]
-async fn silence_segments_into_sentences() {
+async fn rotation_keeps_transcript_intact() {
     let Some(model) = load_model() else { return };
-    // 三段语音之间插 1.6s 数字静音，默认 800ms 断句窗口应切成
-    // Sentence ×2 + Final ×1（最后一段无尾静音，落在 Final）
     let gap = vec![0i16; 1600 * 16];
     let mut pcm = Vec::new();
     let clips = ["tts_short_1", "tts_short_2", "tts_short_3"];
-    let mut refs = Vec::new();
+    let mut refs = String::new();
     for (i, c) in clips.iter().enumerate() {
         if i > 0 {
             pcm.extend_from_slice(&gap);
         }
         pcm.extend_from_slice(&read_wav(&format!("{c}.wav")));
-        refs.push(read_text(&format!("{c}.txt")));
+        refs.push_str(&read_text(&format!("{c}.txt")));
     }
 
-    let (handle, rx) = start(model, Config::default());
+    let (handle, rx) = start(
+        model,
+        Config {
+            rotate: RotatePolicy::Auto {
+                soft_ms: 3000,
+                hard_ms: 60_000,
+            },
+            ..Default::default()
+        },
+    );
     for chunk in pcm.chunks(3200) {
         handle.push(chunk);
     }
@@ -139,35 +149,140 @@ async fn silence_segments_into_sentences() {
     let events = tokio::time::timeout(Duration::from_secs(120), drain(rx))
         .await
         .expect("超时");
-    let mut sentences: Vec<String> = events
+    let finals: Vec<&String> = events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Sentence(t) => Some(t.clone()),
+            AsrEvent::Final(t) => Some(t),
             _ => None,
         })
         .collect();
-    let final_text = events
+    println!("切分出 {} 段：", finals.len());
+    for f in &finals {
+        println!("  {f}");
+    }
+    let got = transcript(&events);
+
+    println!("轮换拼接结果: {got}\n参考: {refs}");
+    assert!(
+        finals.len() >= 3,
+        "两次静音轮换 + 结束定稿应至少产生 3 个 Final: {finals:?}"
+    );
+    assert!(
+        cer(&refs, &got) < 0.2,
+        "CER {:.1}% 超阈值",
+        cer(&refs, &got) * 100.0
+    );
+}
+
+/// 说话中硬切：三段首尾相接（无静音可借）+ 硬上限 3s 强制轮换。接续流
+/// 携带左文与未定稿尾部、切点对齐字间停顿，跨切点不应丢字。
+#[tokio::test]
+async fn hard_rotation_mid_speech_stays_accurate() {
+    let Some(model) = load_model() else { return };
+    let mut pcm = Vec::new();
+    let mut refs = String::new();
+    for c in ["tts_short_1", "tts_short_2", "tts_short_3"] {
+        pcm.extend_from_slice(&read_wav(&format!("{c}.wav")));
+        refs.push_str(&read_text(&format!("{c}.txt")));
+    }
+
+    let (handle, rx) = start(
+        model,
+        Config {
+            rotate: RotatePolicy::Auto {
+                soft_ms: 60_000,
+                hard_ms: 3_000,
+            },
+            ..Default::default()
+        },
+    );
+    for chunk in pcm.chunks(3200) {
+        handle.push(chunk);
+    }
+    handle.finish();
+
+    let events = tokio::time::timeout(Duration::from_secs(120), drain(rx))
+        .await
+        .expect("超时");
+    let finals = events
         .iter()
-        .rev()
-        .find_map(|e| match e {
-            AsrEvent::Final(t) => Some(t.clone()),
+        .filter(|e| matches!(e, AsrEvent::Final(_)))
+        .count();
+    let got = transcript(&events);
+    println!(
+        "硬切 {finals} 段，CER {:.1}%\n  结果: {got}\n  参考: {refs}",
+        cer(&refs, &got) * 100.0
+    );
+    assert!(finals >= 4, "18s 音频按 3s 硬切应产生多个 Final，实际 {finals}");
+    assert!(
+        cer(&refs, &got) < 0.1,
+        "CER {:.1}% 超阈值",
+        cer(&refs, &got) * 100.0
+    );
+}
+
+/// 标点触发轮换：软上限 1s 后遇定稿标点即切。除最后一段（finish 定稿）
+/// 外，每个 Final 都应以标点收尾——行读起来是完整的句/分句；拼接后
+/// 不丢字。
+#[tokio::test]
+async fn punct_policy_finals_end_with_punctuation() {
+    const PUNCT: &[char] = &['，', '。', '？', '！', '、', ',', '.', '?', '!'];
+    let Some(model) = load_model() else { return };
+    let gap = vec![0i16; 1600 * 16];
+    let mut pcm = Vec::new();
+    let mut refs = String::new();
+    for (i, c) in ["tts_short_1", "tts_short_2", "tts_short_3"].iter().enumerate() {
+        if i > 0 {
+            pcm.extend_from_slice(&gap);
+        }
+        pcm.extend_from_slice(&read_wav(&format!("{c}.wav")));
+        refs.push_str(&read_text(&format!("{c}.txt")));
+    }
+
+    let (handle, rx) = start(
+        model,
+        Config {
+            rotate: RotatePolicy::Punct {
+                soft_ms: 1000,
+                hard_ms: 60_000,
+            },
+            ..Default::default()
+        },
+    );
+    for chunk in pcm.chunks(3200) {
+        handle.push(chunk);
+    }
+    handle.finish();
+
+    let events = tokio::time::timeout(Duration::from_secs(120), drain(rx))
+        .await
+        .expect("超时");
+    let finals: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AsrEvent::Final(t) => Some(t),
             _ => None,
         })
-        .expect("应有 Final");
-    sentences.push(final_text);
+        .collect();
+    println!("标点切分出 {} 段：", finals.len());
+    for f in &finals {
+        println!("  {f}");
+    }
+    let got = transcript(&events);
+    println!("CER {:.1}%", cer(&refs, &got) * 100.0);
 
-    println!("切分出 {} 段：", sentences.len());
-    for (s, r) in sentences.iter().zip(&refs) {
-        println!("  [CER {:.1}%] {s}\n     参考: {r}", cer(r, s) * 100.0);
+    assert!(finals.len() >= 3, "应按标点切出多段: {finals:?}");
+    for f in &finals[..finals.len() - 1] {
+        assert!(
+            f.ends_with(PUNCT),
+            "标点触发的 Final 应以标点收尾: {f:?}"
+        );
     }
-    assert_eq!(
-        sentences.len(),
-        3,
-        "应切成 2 句 + 1 个 Final: {sentences:?}"
+    assert!(
+        cer(&refs, &got) < 0.15,
+        "CER {:.1}% 超阈值",
+        cer(&refs, &got) * 100.0
     );
-    for (s, r) in sentences.iter().zip(&refs) {
-        assert!(cer(r, s) < 0.2, "CER {:.1}% 超阈值", cer(r, s) * 100.0);
-    }
 }
 
 #[tokio::test]
@@ -198,14 +313,7 @@ async fn realtime_feed_produces_partials() {
             _ => None,
         })
         .collect();
-    let final_text = events
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            AsrEvent::Final(t) => Some(t.clone()),
-            _ => None,
-        })
-        .expect("应有 Final");
+    let final_text = transcript(&events);
     println!(
         "{} 个中间结果，首个: {}",
         partials.len(),
@@ -217,7 +325,7 @@ async fn realtime_feed_produces_partials() {
 }
 
 /// 双流并发：桌面 + 麦克风场景。共享同一 Arc<Model>，两路同时喂入，
-/// 各自独立断句定稿——验证模型与计算池的并发复用。
+/// 各自独立轮换定稿——验证模型与计算池的并发复用。
 #[tokio::test]
 async fn two_streams_share_one_model() {
     let Some(model) = load_model() else { return };
@@ -240,16 +348,11 @@ async fn two_streams_share_one_model() {
             }
             handle.finish();
         });
-        // 尾静音可能把文本以 Sentence 定稿，Final 只带剩余，需拼接
+        // 拼接所有 Final，直到通道关闭
         let mut text = String::new();
         while let Some(ev) = rx.recv().await {
-            match ev {
-                AsrEvent::Sentence(t) => text += &t,
-                AsrEvent::Final(t) => {
-                    text += &t;
-                    break;
-                }
-                AsrEvent::Partial(_) => {}
+            if let AsrEvent::Final(t) = ev {
+                text += &t;
             }
         }
         feeder.await.unwrap();

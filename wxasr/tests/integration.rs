@@ -259,6 +259,106 @@ fn long_clip_streams_and_stays_accurate() {
     assert!(e < 0.25, "长音频流式 CER {:.1}% 超阈值", e * 100.0);
 }
 
+/// 说话中硬切（无静音可借）：对比「全切」（每次换全新流，切点后无左文）
+/// 与 `rotate`（blank 对齐切点 + 携带左文与未定稿尾部接续）。跨多个
+/// 切割间隔扫描，接续流总体应不差且有明确优势。
+#[test]
+fn rotate_carries_left_context_across_cuts() {
+    let Some(model) = load_model() else { return };
+    let cases = tts_cases();
+    // 优先用长音频（切割次数多，统计更稳）；缺失时拼接三条短音频
+    let (pcm, text) = match cases
+        .iter()
+        .find(|(w, _)| w.file_stem().unwrap().to_str().unwrap().starts_with("tts_long"))
+    {
+        Some((wav, text)) => {
+            let mut r = hound::WavReader::open(wav).unwrap();
+            (
+                r.samples::<i16>().map(|s| s.unwrap()).collect::<Vec<_>>(),
+                text.clone(),
+            )
+        }
+        None => {
+            let short: Vec<_> = cases
+                .iter()
+                .filter(|(w, _)| {
+                    w.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("tts_short_"))
+                })
+                .take(3)
+                .collect();
+            if short.len() < 3 {
+                eprintln!("[skip] 无 tts_long_*.wav 且短音频不足 3 条");
+                return;
+            }
+            let mut pcm = Vec::new();
+            let mut text = String::new();
+            for (wav, t) in &short {
+                let mut r = hound::WavReader::open(wav).unwrap();
+                pcm.extend(r.samples::<i16>().map(|s| s.unwrap()));
+                text.push_str(t);
+            }
+            (pcm, text)
+        }
+    };
+    println!(
+        "音频 {:.1}s，参考: {text}",
+        pcm.len() as f64 / 16000.0
+    );
+
+    let mut worst_carry = 0.0f64;
+    let mut sum_full = 0.0f64;
+    let mut sum_carry = 0.0f64;
+    for cut_s in [2.0f64, 2.5, 3.0, 4.0, 5.0, 7.0] {
+        let cut = (cut_s * 16000.0) as usize;
+        let run = |rotate: bool| -> String {
+            let (mut s, mut fed, mut out) = (model.stream(), 0, String::new());
+            for chunk in pcm.chunks(3200) {
+                s.push(chunk);
+                fed += chunk.len();
+                if fed >= cut {
+                    let (t, next) = if rotate {
+                        s.rotate()
+                    } else {
+                        let t = s.finish();
+                        (t, model.stream())
+                    };
+                    out.push_str(&t);
+                    s = next;
+                    fed = 0;
+                }
+            }
+            out.push_str(&s.finish());
+            out
+        };
+        let full_cut = run(false);
+        let carried = run(true);
+        let (e_full, e_carry) = (cer(&text, &full_cut), cer(&text, &carried));
+        sum_full += e_full;
+        sum_carry += e_carry;
+        worst_carry = worst_carry.max(e_carry);
+        println!(
+            "切距 {cut_s:.1}s：全切 CER {:>5.1}%  接续流 CER {:>5.1}%",
+            e_full * 100.0,
+            e_carry * 100.0
+        );
+    }
+    println!(
+        "均值：全切 {:.1}% vs 接续流 {:.1}%（接续流最差 {:.1}%）",
+        sum_full / 6.0 * 100.0,
+        sum_carry / 6.0 * 100.0,
+        worst_carry * 100.0
+    );
+    assert!(
+        sum_carry <= sum_full,
+        "接续流平均 CER ({:.1}%) 不应比全切 ({:.1}%) 差",
+        sum_carry / 6.0 * 100.0,
+        sum_full / 6.0 * 100.0
+    );
+    assert!(worst_carry < 0.15, "接续流最差 CER {:.1}% 超阈值", worst_carry * 100.0);
+}
+
 #[test]
 fn rtf_under_one() {
     let Some(model) = load_model() else { return };

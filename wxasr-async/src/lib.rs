@@ -1,17 +1,36 @@
 //! wxasr-async —— [wxasr](../wxasr) 的异步事件流封装。
 //!
 //! 结构：一个专用识别线程拥有 [`wxasr::Stream`]（CPU 密集、有状态，
-//! 不适合放进 async 执行器），负责中间结果节流与静音断句；事件经
+//! 不适合放进 async 执行器），负责中间结果节流与上下文轮换；事件经
 //! tokio mpsc 桥接到 async 侧，async 只做分发。音频喂入是同步接口，
 //! 可直接在采集回调里调用。
 //!
 //! # 事件流
 //!
-//! - [`AsrEvent::Partial`]：中间结果，已按计算成本自动节流（新增 ≥
-//!   `partial_min_fresh` 帧，且距上次 ≥ 3× 上次计算耗时，慢机自动降频）
-//! - [`AsrEvent::Sentence`]：静音超过 `silence_ms` 自动断句定稿
-//! - [`AsrEvent::Final`]：[`AsrHandle::finish`] 或所有句柄 drop 后的
-//!   最后一段定稿，是关闭事件
+//! - [`AsrEvent::Partial`]：当前段（上次定稿之后）的中间结果，已按
+//!   计算成本自动节流（新增 ≥ `partial_min_fresh` 帧，且距上次 ≥ 3×
+//!   上次计算耗时，慢机自动降频）
+//! - [`AsrEvent::Final`]：一段定稿。每次上下文轮换产生一个；
+//!   [`AsrHandle::finish`] 或所有句柄 drop 时再为最后一段产生一个
+//!   （空文本不发）。之后的 `Partial` 从空开始
+//! - 通道关闭（`recv` 返回 `None`）表示会话结束
+//!
+//! 完整转写 = 按顺序拼接所有 `Final`。
+//!
+//! # 上下文轮换
+//!
+//! [`wxasr::Stream`] 的内部状态（特征帧缓冲约 16KB/s、已定稿 token）
+//! 随会话时长线性增长，长会话会持续挤压内存并拖慢中间结果。worker
+//! 按 [`policy::RotatePolicy`] 在合适的时机定稿当前流、发出 `Final`
+//! 并接续（新流携带切点前 1s 左文与切点后未定稿尾部，切点取在字间
+//! 停顿处——说话中硬切也不丢字）。worker 不保留已定稿文本，资源
+//! 占用与会话总长无关。
+//!
+//! 默认策略：累计 15s 后于下一次 ≥500ms 静音处轮换；累计 20s 强制
+//! 轮换。[`policy::RotatePolicy::Punct`] 改为标点触发：软上限后遇定稿标点即
+//! 切，`Final` 以标点收尾。注意硬上限可能在说话中触发，定稿解码
+//! （约半秒）期间 worker 暂停消费音频（通道不丢数据，只是中间结果
+//! 晚到）。
 //!
 //! # 入门
 //!
@@ -25,11 +44,11 @@
 //!
 //! while let Some(ev) = rx.recv().await {
 //!     match ev {
-//!         AsrEvent::Partial(t) => { /* 边说边显 */ }
-//!         AsrEvent::Sentence(t) => { /* 断句上屏 */ }
-//!         AsrEvent::Final(t) => { println!("{t}"); break; }
+//!         AsrEvent::Partial(t) => { /* 当前段边说边显 */ }
+//!         AsrEvent::Final(t) => println!("{t}"), // 一段定稿
 //!     }
 //! }
+//! // 通道关闭：会话结束
 //! # }
 //! ```
 //!
@@ -38,28 +57,30 @@
 //! 内置轻量自适应 VAD：噪声底取静音段 RMS 的滑动均值（初值为首个
 //! 块的 RMS），判定 `rms > max(噪声底×4, 80)`。数字静音与不同增益的
 //! 麦克风均可工作；注意初值取自首个块，若开口极快请先喂一小段环境音。
+//! VAD 不直接面向用户，它为轮换策略提供静音信号。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use wxasr::Model;
-
+pub mod policy;
+use policy::{RotateCtx, RotatePolicy};
 /// 识别事件（按时间顺序产生）
 #[derive(Debug, Clone)]
 pub enum AsrEvent {
-    /// 中间结果（已节流，仅当开启 `Config::partial`）
+    /// 当前段的中间结果（已节流，仅当开启 `Config::partial`）；
+    /// 每次 [`Final`](Self::Final) 之后从空开始
     Partial(String),
-    /// 静音断句定稿
-    Sentence(String),
-    /// 结束后的最后一段定稿；收到它之后通道将关闭
+    /// 一段定稿：上下文轮换时、以及结束时的最后一段各产生一个（空文本
+    /// 不发）。不是关闭事件——会话结束以通道关闭为准
     Final(String),
 }
 
 /// 运行配置
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// 静音断句窗口（毫秒），0 = 不自动断句
-    pub silence_ms: u32,
+    /// 上下文轮换策略，决定何时定稿当前流并重建以约束资源增长
+    pub rotate: RotatePolicy,
     /// 是否产生 [`AsrEvent::Partial`]
     pub partial: bool,
     /// 中间结果的最小新增帧数（10ms/帧）
@@ -74,7 +95,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            silence_ms: 800,
+            rotate: RotatePolicy::default(),
             partial: true,
             partial_min_fresh: 30,
             event_capacity: 64,
@@ -102,8 +123,8 @@ impl AsrHandle {
         let _ = self.tx.send(AudioMsg::Pcm(pcm.to_vec()));
     }
 
-    /// 结束识别：识别线程定稿最后一段并发送 [`AsrEvent::Final`]。
-    /// 消耗 self；所有句柄 drop 时同样触发结束。
+    /// 结束识别：识别线程定稿最后一段并发送 [`AsrEvent::Final`]，
+    /// 随后关闭事件通道。消耗 self；所有句柄 drop 时同样触发结束。
     pub fn finish(self) {
         let _ = self.tx.send(AudioMsg::End);
     }
@@ -137,7 +158,8 @@ fn worker(
 ) {
     let mut stream = model.stream();
     let mut vad = Vad::default();
-    let mut quiet_ms = 0u32;
+    let mut quiet_ms = 0u32; // 音频尾部连续静音（描述音频，轮换不清零）
+    let mut stream_ms = 0u32; // 当前流累计音频
     let mut last_emit = Instant::now();
     let mut last_cost = Duration::ZERO;
     let mut last_partial = String::new();
@@ -151,6 +173,7 @@ fn worker(
             quiet_ms + ms
         };
         stream.push(&pcm);
+        stream_ms += ms;
 
         // 中间结果：新增够多、且距上次间隔不少于上次计算耗时的 3 倍
         if cfg.partial
@@ -169,18 +192,33 @@ fn worker(
             }
         }
 
-        // 静音断句：定稿当前句，换新 Stream（权重共享，重建的只是特征状态）
-        if cfg.silence_ms > 0 && quiet_ms >= cfg.silence_ms {
-            let text = stream.finish();
-            stream = model.stream();
-            quiet_ms = 0;
-            last_partial.clear();
-            if !text.is_empty() && out.blocking_send(AsrEvent::Sentence(text)).is_err() {
-                return;
+        // 上下文轮换：定稿当前流并接续（携带切点前 1s 左文与切点后未
+        // 定稿尾部）。标点触发时切点优先取标点处，Final 以标点收尾
+        if stream_ms > 0 {
+            let ctx = RotateCtx {
+                stream_ms,
+                silence_ms: quiet_ms,
+                punct_ms: stream.punct_ms(),
+            };
+            if cfg.rotate.should_rotate(&ctx) {
+                let (text, next) = if cfg.rotate.punct_hit(&ctx) {
+                    stream.rotate_at_punct()
+                } else {
+                    stream.rotate()
+                };
+                stream = next;
+                stream_ms = 0;
+                last_partial.clear();
+                if !text.is_empty() && out.blocking_send(AsrEvent::Final(text)).is_err() {
+                    return;
+                }
             }
         }
     }
-    let _ = out.blocking_send(AsrEvent::Final(stream.finish()));
+    let text = stream.finish();
+    if !text.is_empty() {
+        let _ = out.blocking_send(AsrEvent::Final(text));
+    }
 }
 
 /// 轻量自适应 VAD。
