@@ -1,36 +1,28 @@
-//! wxasr-async —— [wxasr](../wxasr) 的异步事件流封装。
+//! wxasr-async —— 流式 ASR 的统一异步层:专用识别线程 + 通道桥。
 //!
-//! 结构：一个专用识别线程拥有 [`wxasr::Stream`]（CPU 密集、有状态，
-//! 不适合放进 async 执行器），负责中间结果节流与上下文轮换；事件经
-//! tokio mpsc 桥接到 async 侧，async 只做分发。音频喂入是同步接口，
-//! 可直接在采集回调里调用。
+//! 统一层只做桥:音频经 std mpsc 进入([`AsrHandle::push`] 同步、非阻塞,
+//! 可直接在采集回调里调用),事件经 tokio mpsc 流出到 async 侧,async
+//! 只做分发;识别线程驱动后端([`AsrBackend`])创建的会话
+//! ([`AsrSession`]),会话语义(中间结果节流、上下文轮换、定稿兜底)
+//! 全部由后端自持,不进 async 执行器。
+//!
+//! wxasr 是第一个后端([`backend_wxasr::WxasrBackend`]):VAD、partial
+//! 节流与 [`policy`] 轮换都住在那里,经 [`start`] 开箱即用;其他后端
+//! (如未来的 hex-asr)实现 [`AsrBackend`]/[`AsrSession`] 后经
+//! [`start_with`] 接入,与 wxasr 共享同一套线程/通道桥与事件流
+//! (轮换与 VAD 的语义见 [`backend_wxasr`] 模块文档)。
 //!
 //! # 事件流
 //!
-//! - [`AsrEvent::Partial`]：当前段（上次定稿之后）的中间结果，已按
-//!   计算成本自动节流（新增 ≥ `partial_min_fresh` 帧，且距上次 ≥ 3×
-//!   上次计算耗时，慢机自动降频）
-//! - [`AsrEvent::Final`]：一段定稿。每次上下文轮换产生一个；
+//! - [`AsrEvent::Partial`][]:当前段(上次定稿之后)的中间结果。wxasr
+//!   后端已按计算成本自动节流(新增 ≥ `partial_min_fresh` 帧,且距
+//!   上次 ≥ 3× 上次计算耗时,慢机自动降频)
+//! - [`AsrEvent::Final`][]:一段定稿。wxasr 后端每次上下文轮换产生一个;
 //!   [`AsrHandle::finish`] 或所有句柄 drop 时再为最后一段产生一个
-//!   （空文本不发）。之后的 `Partial` 从空开始
-//! - 通道关闭（`recv` 返回 `None`）表示会话结束
+//!   (空文本不发)。之后的 `Partial` 从空开始
+//! - 通道关闭(`recv` 返回 `None`)表示会话结束
 //!
 //! 完整转写 = 按顺序拼接所有 `Final`。
-//!
-//! # 上下文轮换
-//!
-//! [`wxasr::Stream`] 的内部状态（特征帧缓冲约 16KB/s、已定稿 token）
-//! 随会话时长线性增长，长会话会持续挤压内存并拖慢中间结果。worker
-//! 按 [`policy::RotatePolicy`] 在合适的时机定稿当前流、发出 `Final`
-//! 并接续（新流携带切点前 1s 左文与切点后未定稿尾部，切点取在字间
-//! 停顿处——说话中硬切也不丢字）。worker 不保留已定稿文本，资源
-//! 占用与会话总长无关。
-//!
-//! 默认策略：累计 15s 后于下一次 ≥500ms 静音处轮换；累计 20s 强制
-//! 轮换。[`policy::RotatePolicy::Punct`] 改为标点触发：软上限后遇定稿标点即
-//! 切，`Final` 以标点收尾。注意硬上限可能在说话中触发，定稿解码
-//! （约半秒）期间 worker 暂停消费音频（通道不丢数据，只是中间结果
-//! 晚到）。
 //!
 //! # 入门
 //!
@@ -48,47 +40,75 @@
 //!         AsrEvent::Final(t) => println!("{t}"), // 一段定稿
 //!     }
 //! }
-//! // 通道关闭：会话结束
+//! // 通道关闭:会话结束
 //! # }
 //! ```
 //!
-//! # 静音检测
-//!
-//! 内置轻量自适应 VAD：噪声底取静音段 RMS 的滑动均值（初值为首个
-//! 块的 RMS），判定 `rms > max(噪声底×4, 80)`。数字静音与不同增益的
-//! 麦克风均可工作；注意初值取自首个块，若开口极快请先喂一小段环境音。
-//! VAD 不直接面向用户，它为轮换策略提供静音信号。
+//! 换其他后端只需把 [`start`] 换成 [`start_with`],事件流不变。
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use wxasr::Model;
+pub mod backend_wxasr;
 pub mod policy;
-use policy::{RotateCtx, RotatePolicy};
-/// 识别事件（按时间顺序产生）
+use policy::RotatePolicy;
+/// 识别事件(按时间顺序产生)
 #[derive(Debug, Clone)]
 pub enum AsrEvent {
-    /// 当前段的中间结果（已节流，仅当开启 `Config::partial`）；
+    /// 当前段的中间结果(已节流,仅当开启 `Config::partial`);
     /// 每次 [`Final`](Self::Final) 之后从空开始
     Partial(String),
-    /// 一段定稿：上下文轮换时、以及结束时的最后一段各产生一个（空文本
-    /// 不发）。不是关闭事件——会话结束以通道关闭为准
+    /// 一段定稿:上下文轮换时、以及结束时的最后一段各产生一个(空文本
+    /// 不发)。不是关闭事件——会话结束以通道关闭为准
     Final(String),
 }
 
-/// 运行配置
+/// 会话的事件出口,由统一 worker 提供给后端。
+///
+/// `emit` 返回 `false` 表示消费端已关闭,后端应尽快收尾:停止后续
+/// 计算,不必再发事件(发了也会被丢弃)
+pub trait AsrEvents {
+    /// 发送一个事件;返回 `false` 表示消费端已关闭
+    fn emit(&mut self, ev: AsrEvent) -> bool;
+}
+
+/// 一个流式识别会话,由统一 worker 在专用识别线程上驱动。实现方
+/// 持有全部会话语义(中间结果节流、轮换/定稿、兜底),不进 async
+/// 执行器
+pub trait AsrSession: Send {
+    /// 喂 16kHz 单声道 i16,任意块大小
+    fn push(&mut self, pcm: &[i16], out: &mut dyn AsrEvents);
+    /// 定稿最后一段并结束(空文本不发事件)
+    fn finish(&mut self, out: &mut dyn AsrEvents);
+}
+
+/// ASR 后端:为每次启动创建一个 [`AsrSession`]
+pub trait AsrBackend: Send + Sync {
+    /// 在识别线程内调用。失败时会话立即结束:事件通道关闭、不产生
+    /// 任何事件(消费端看到空会话)
+    fn open(&self, cfg: &Config) -> eyre::Result<Box<dyn AsrSession>>;
+}
+
+/// 运行配置。
+///
+/// 字段分两层:`rotate`/`partial`/`partial_min_fresh` 是会话语义,由
+/// wxasr 后端解释(其他后端按自身语义处理或忽略);`event_capacity`/
+/// `thread_name` 属统一层,与后端无关。后端自身的专属配置放后端的
+/// 构造参数,不进 `Config`
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// 上下文轮换策略，决定何时定稿当前流并重建以约束资源增长
+    /// 上下文轮换策略,决定何时定稿当前流并重建以约束资源增长
+    /// (wxasr 后端解释)
     pub rotate: RotatePolicy,
-    /// 是否产生 [`AsrEvent::Partial`]
+    /// 是否产生 [`AsrEvent::Partial`] (wxasr 后端解释)
     pub partial: bool,
-    /// 中间结果的最小新增帧数（10ms/帧）
+    /// 中间结果的最小新增帧数(10ms/帧;wxasr 后端解释)
     pub partial_min_fresh: usize,
-    /// 事件通道容量（消费方卡死时识别线程最多积压这么多事件）
+    /// 事件通道容量(统一层:消费方卡死时识别线程最多积压这么多事件)
     pub event_capacity: usize,
-    /// 识别线程名。`None` 时自动生成 `wxasr-<uuidv7>`（时间有序，天然唯一），
-    /// 多流并发无需配置也不会重名；需要可读名字（如 "wxasr-desktop"）时显式传入。
+    /// 识别线程名(统一层)。`None` 时自动生成 `wxasr-<uuidv7>`(时间
+    /// 有序,天然唯一;crate 历史默认,统一层沿用),多流并发无需配置
+    /// 也不会重名;需要可读名字(如 "wxasr-desktop")时显式传入。
     pub thread_name: Option<String>,
 }
 
@@ -109,207 +129,255 @@ enum AudioMsg {
     End,
 }
 
-/// 音频喂入端。`Clone` 后可多处持有（如采集回调与停止按钮）；
-/// 任一处调用 [`finish`](Self::finish) 即结束识别，之后的 `push` 静默忽略。
+/// 音频喂入端。`Clone` 后可多处持有(如采集回调与停止按钮);
+/// 任一处调用 [`finish`](Self::finish) 即结束识别,之后的 `push` 静默忽略。
 #[derive(Clone)]
 pub struct AsrHandle {
     tx: std::sync::mpsc::Sender<AudioMsg>,
 }
 
 impl AsrHandle {
-    /// 喂入一段 16kHz 单声道 i16 PCM（任意块大小）。
-    /// 同步、非阻塞、不丢数据，可直接在采集回调里调用。
+    /// 喂入一段 16kHz 单声道 i16 PCM(任意块大小)。
+    /// 同步、非阻塞、不丢数据,可直接在采集回调里调用。
     pub fn push(&self, pcm: &[i16]) {
         let _ = self.tx.send(AudioMsg::Pcm(pcm.to_vec()));
     }
 
-    /// 结束识别：识别线程定稿最后一段并发送 [`AsrEvent::Final`]，
-    /// 随后关闭事件通道。消耗 self；所有句柄 drop 时同样触发结束。
+    /// 结束识别:识别线程定稿最后一段并发送 [`AsrEvent::Final`],
+    /// 随后关闭事件通道。消耗 self;所有句柄 drop 时同样触发结束。
     pub fn finish(self) {
         let _ = self.tx.send(AudioMsg::End);
     }
 }
 
-/// 启动识别。返回（喂入端，事件流）。
+/// 用 wxasr 后端启动识别(等价于
+/// `start_with(Box::new(WxasrBackend::new(model)), cfg)`)。返回(喂入端,事件流)。
 ///
-/// 多个识别流可共享同一 `Arc<Model>`：权重与内部计算线程池全局复用，
-/// 每流仅一个 worker 线程与各自的流式状态（特征/VAD）。并发流建议
+/// 多个识别流可共享同一 `Arc<Model>`:权重与内部计算线程池全局复用,
+/// 每流仅一个 worker 线程与各自的流式状态(特征/VAD)。并发流建议
 /// 通过 [`Config::thread_name`] 各自命名。
 pub fn start(model: Arc<Model>, cfg: Config) -> (AsrHandle, mpsc::Receiver<AsrEvent>) {
+    start_with(Box::new(backend_wxasr::WxasrBackend::new(model)), cfg)
+}
+
+/// 通用入口:用任意 [`AsrBackend`] 启动识别。返回(喂入端,事件流)。
+///
+/// 统一层 spawn 一个专用识别线程,在其中 `backend.open(&cfg)` 创建会话
+/// 并驱动:音频经 [`AsrHandle::push`] 进,事件经 tokio mpsc 出;
+/// [`AsrHandle::finish`] 或所有句柄 drop 时调用 [`AsrSession::finish`]
+/// 定稿并关闭事件通道;消费端提前关闭时识别线程停止驱动、直接丢弃
+/// 会话(不定稿)。线程默认名沿用 `wxasr-<uuidv7>`,并发流用
+/// [`Config::thread_name`] 各自命名。
+pub fn start_with(
+    backend: Box<dyn AsrBackend>,
+    cfg: Config,
+) -> (AsrHandle, mpsc::Receiver<AsrEvent>) {
     let (audio_tx, audio_rx) = std::sync::mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel(cfg.event_capacity);
     let name = match cfg.thread_name.clone() {
         Some(n) => n,
-        // uuidv7：时间有序、并发不重名（Linux 线程名 15 字节截断不影响前缀唯一性）
+        // uuidv7:时间有序、并发不重名(Linux 线程名 15 字节截断不影响前缀唯一性)
         None => format!("wxasr-{}", uuid::Uuid::now_v7()),
     };
     std::thread::Builder::new()
         .name(name)
-        .spawn(move || worker(model, cfg, audio_rx, event_tx))
+        .spawn(move || worker(backend.as_ref(), cfg, audio_rx, event_tx))
         .expect("识别线程创建失败");
     (AsrHandle { tx: audio_tx }, event_rx)
 }
 
 fn worker(
-    model: Arc<Model>,
+    backend: &dyn AsrBackend,
     cfg: Config,
     audio: std::sync::mpsc::Receiver<AudioMsg>,
     out: mpsc::Sender<AsrEvent>,
 ) {
-    let mut stream = model.stream();
-    let mut vad = Vad::default();
-    let mut quiet_ms = 0u32; // 音频尾部连续静音（描述音频，轮换不清零）
-    let mut stream_ms = 0u32; // 当前流累计音频
-    let mut last_emit = Instant::now();
-    let mut last_cost = Duration::ZERO;
-    let mut last_partial = String::new();
-
+    // open 失败:会话立即结束(通道关闭,不产生事件),见 AsrBackend::open
+    let Ok(mut session) = backend.open(&cfg) else {
+        return;
+    };
+    let mut sink = EventSink {
+        tx: out,
+        closed: false,
+    };
+    // 消费端提前关闭:直接丢弃会话、不调用 finish,与旧版 worker
+    // blocking_send 出错即 return 的行为一致
+    let mut consumer_alive = true;
     while let Ok(msg) = audio.recv() {
         let AudioMsg::Pcm(pcm) = msg else { break };
-        let ms = pcm.len() as u32 / 16; // 16000 Hz → 16 样本/ms
-        quiet_ms = if vad.is_speech(&pcm) {
-            0
-        } else {
-            quiet_ms + ms
-        };
-        stream.push(&pcm);
-        stream_ms += ms;
-
-        // 中间结果：新增够多、且距上次间隔不少于上次计算耗时的 3 倍
-        if cfg.partial
-            && stream.fresh() >= cfg.partial_min_fresh
-            && last_emit.elapsed() >= last_cost * 3
-        {
-            let t0 = Instant::now();
-            let p = stream.partial();
-            last_cost = t0.elapsed();
-            last_emit = Instant::now();
-            if !p.is_empty() && p != last_partial {
-                last_partial = p.clone();
-                if out.blocking_send(AsrEvent::Partial(p)).is_err() {
-                    return; // 消费端已关闭
-                }
-            }
-        }
-
-        // 上下文轮换：定稿当前流并接续（携带切点前 1s 左文与切点后未
-        // 定稿尾部）。标点触发时切点优先取标点处，Final 以标点收尾
-        if stream_ms > 0 {
-            let ctx = RotateCtx {
-                stream_ms,
-                silence_ms: quiet_ms,
-                punct_ms: stream.punct_ms(),
-            };
-            if cfg.rotate.should_rotate(&ctx) {
-                let (text, next) = if cfg.rotate.punct_hit(&ctx) {
-                    stream.rotate_at_punct()
-                } else {
-                    stream.rotate()
-                };
-                stream = next;
-                stream_ms = 0;
-                last_partial.clear();
-                if !text.is_empty() && out.blocking_send(AsrEvent::Final(text)).is_err() {
-                    return;
-                }
-            }
+        session.push(&pcm, &mut sink);
+        if sink.closed {
+            consumer_alive = false;
+            break;
         }
     }
-    let text = stream.finish();
-    if !text.is_empty() {
-        let _ = out.blocking_send(AsrEvent::Final(text));
+    if consumer_alive {
+        session.finish(&mut sink);
     }
 }
 
-/// 轻量自适应 VAD。
-///
-/// 判定用 25ms 子块的 RMS 峰值：语音有音节起伏（峰值高），平稳底噪
-/// 无论多响峰值都接近均值，因此比整块均值更能区分「软语音 vs 响底噪」。
-/// 语音判定：峰值 > 噪声底×2.5 + 150（i16 幅度尺度）。
-/// 噪声底只在静音段更新，且非对称：快速下跟、极慢上漂——防止被
-/// 误判的软语音棘轮式抬高阈值。
-struct Vad {
-    noise: Option<f32>,
+/// [`AsrEvents`] 的统一实现:包装 tokio `Sender` 的 `blocking_send`
+/// (识别线程不是 async 上下文;有界通道满时阻塞,即事件背压)。
+/// 消费端关闭返回 `false` 并记下,worker 据此停止驱动
+struct EventSink {
+    tx: mpsc::Sender<AsrEvent>,
+    closed: bool,
 }
 
-impl Default for Vad {
-    fn default() -> Self {
-        Vad { noise: None }
-    }
-}
-
-impl Vad {
-    fn rms(pcm: &[i16]) -> f32 {
-        if pcm.is_empty() {
-            return 0.0;
+impl AsrEvents for EventSink {
+    fn emit(&mut self, ev: AsrEvent) -> bool {
+        if self.tx.blocking_send(ev).is_err() {
+            self.closed = true; // 消费端已关闭
+            return false;
         }
-        (pcm.iter().map(|&v| v as f32 * v as f32).sum::<f32>() / pcm.len() as f32).sqrt()
-    }
-
-    fn is_speech(&mut self, pcm: &[i16]) -> bool {
-        // 25ms 子块 RMS 峰值
-        let peak = pcm.chunks(400).map(Self::rms).fold(0.0f32, f32::max);
-        let avg = Self::rms(pcm);
-        let noise = *self.noise.get_or_insert(avg);
-        let speech = peak > noise * 2.5 + 150.0;
-        if !speech {
-            self.noise = Some(if avg < noise {
-                noise * 0.8 + avg * 0.2 // 环境变安静：快速下跟
-            } else {
-                noise * 0.999 + avg * 0.001 // 环境变嘈杂：极慢上漂
-            });
-        }
-        speech
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
-    fn tone(n: usize, amp: f64) -> Vec<i16> {
-        (0..n)
-            .map(|i| (amp * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 16000.0).sin()) as i16)
-            .collect()
+    /// 假后端:累计音频毫秒,满 100ms 发一个 Partial,finish 发 Final
+    struct CountBackend;
+
+    impl AsrBackend for CountBackend {
+        fn open(&self, _cfg: &Config) -> eyre::Result<Box<dyn AsrSession>> {
+            Ok(Box::new(CountSession {
+                ms: 0,
+                partial_sent: false,
+            }))
+        }
+    }
+
+    struct CountSession {
+        ms: u32,
+        partial_sent: bool,
+    }
+
+    impl AsrSession for CountSession {
+        fn push(&mut self, pcm: &[i16], out: &mut dyn AsrEvents) {
+            self.ms += pcm.len() as u32 / 16;
+            if self.ms >= 100 && !self.partial_sent {
+                self.partial_sent = true;
+                out.emit(AsrEvent::Partial("够 100ms 了".into()));
+            }
+        }
+
+        fn finish(&mut self, out: &mut dyn AsrEvents) {
+            out.emit(AsrEvent::Final(format!("{}ms", self.ms)));
+        }
     }
 
     #[test]
-    fn vad_distinguishes_silence_and_speech() {
-        let mut vad = Vad::default();
-        // 数字静音：不是语音，且把噪声底拉低
-        assert!(!vad.is_speech(&vec![0i16; 1600]));
-        // 440Hz 中等音量：语音
-        assert!(vad.is_speech(&tone(1600, 3000.0)));
-        // 静音后小幅底噪仍不是语音
-        assert!(!vad.is_speech(&vec![0i16; 1600]));
-        let quiet = tone(1600, 30.0);
-        assert!(!vad.is_speech(&quiet), "噪声底应自适应到小幅信号");
+    fn start_with_drives_backend_until_handle_finish() {
+        let (handle, mut rx) = start_with(Box::new(CountBackend), Config::default());
+        handle.push(&[0i16; 1600]); // 100ms
+        handle.finish();
+        let ev = rx.blocking_recv();
+        assert!(
+            matches!(ev, Some(AsrEvent::Partial(ref t)) if t == "够 100ms 了"),
+            "应为 Partial,实际 {ev:?}"
+        );
+        let ev = rx.blocking_recv();
+        assert!(
+            matches!(ev, Some(AsrEvent::Final(ref t)) if t == "100ms"),
+            "应为 Final,实际 {ev:?}"
+        );
+        assert!(rx.blocking_recv().is_none()); // 通道关闭 = 会话结束
     }
 
     #[test]
-    fn vad_uses_peak_not_average() {
-        // 平稳信号（如空调/TTS 嗡声）：子块峰值≈均值，无论多响都不是语音
-        let mut vad = Vad::default();
-        let hum = tone(6400, 1000.0); // RMS ≈ 707
-        assert!(!vad.is_speech(&hum));
-        assert!(!vad.is_speech(&hum));
-        // 音节式信号：平均响度与底噪相当，但 25ms 峰值远超阈值 → 语音
-        let syllabic: Vec<i16> = (0..6400)
-            .map(|i| {
-                let amp = if (i / 400) % 2 == 0 { 3000.0 } else { 200.0 };
-                (amp * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 16000.0).sin()) as i16
-            })
-            .collect();
-        assert!(vad.is_speech(&syllabic));
+    fn dropping_all_handles_finishes_session() {
+        let (handle, mut rx) = start_with(Box::new(CountBackend), Config::default());
+        handle.push(&[0i16; 320]); // 20ms
+        drop(handle);
+        let ev = rx.blocking_recv();
+        assert!(
+            matches!(ev, Some(AsrEvent::Final(ref t)) if t == "20ms"),
+            "应为 Final,实际 {ev:?}"
+        );
+        assert!(rx.blocking_recv().is_none());
     }
 
+    /// 探针会话:记录被调用的事件。push 每块都发事件,以尽快探测
+    /// 消费端;`emit` 返回 false 后不再计算(尊重 false)
+    struct ProbeSession {
+        log: Arc<Mutex<Vec<&'static str>>>,
+        dead: bool,
+    }
+
+    impl ProbeSession {
+        fn record(&self, ev: &'static str) {
+            // poison 容忍:消费方测试可能因断言失败带锁 panic
+            self.log.lock().unwrap_or_else(|e| e.into_inner()).push(ev);
+        }
+    }
+
+    impl AsrSession for ProbeSession {
+        fn push(&mut self, _pcm: &[i16], out: &mut dyn AsrEvents) {
+            if self.dead {
+                return;
+            }
+            self.record("push");
+            if !out.emit(AsrEvent::Partial("x".into())) {
+                self.dead = true;
+            }
+        }
+
+        fn finish(&mut self, out: &mut dyn AsrEvents) {
+            self.record("finish");
+            let _ = out.emit(AsrEvent::Final("final".into()));
+        }
+    }
+
+    impl Drop for ProbeSession {
+        fn drop(&mut self) {
+            self.record("drop");
+        }
+    }
+
+    /// 消费端关闭:worker 停止驱动、丢弃会话,不调用 finish
+    /// (与旧版 blocking_send 出错即 return 等价)
     #[test]
-    fn vad_initializes_from_loud_environment() {
-        // 首块就是大底噪（如空调声）：讲话仍可判语音
-        let mut vad = Vad::default();
-        let hum = tone(6400, 700.0);
-        assert!(!vad.is_speech(&hum));
-        assert!(!vad.is_speech(&vec![0i16; 1600]));
-        assert!(vad.is_speech(&tone(6400, 6000.0)));
+    fn consumer_close_drops_session_without_finish() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (handle, rx) = start_with(Box::new(ProbeBackend(log.clone())), Config::default());
+        handle.push(&[0i16; 1600]);
+        drop(rx);
+        for _ in 0..8 {
+            handle.push(&[0i16; 1600]); // 至少一块的 emit 必然失败
+        }
+        handle.finish(); // End 不再被处理:worker 在此之前已停止驱动
+
+        // 读快照(不持锁断言),等 worker 退出(会话 drop)
+        let snapshot = |log: &Arc<Mutex<Vec<&'static str>>>| {
+            log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !snapshot(&log).contains(&"drop") {
+            assert!(
+                Instant::now() < deadline,
+                "worker 未退出: {:?}",
+                snapshot(&log)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let l = snapshot(&log);
+        assert!(l.contains(&"push"), "至少应处理过一块: {l:?}");
+        assert!(!l.contains(&"finish"), "消费端关闭后不应定稿: {l:?}");
+    }
+
+    struct ProbeBackend(Arc<Mutex<Vec<&'static str>>>);
+
+    impl AsrBackend for ProbeBackend {
+        fn open(&self, _cfg: &Config) -> eyre::Result<Box<dyn AsrSession>> {
+            Ok(Box::new(ProbeSession {
+                log: self.0.clone(),
+                dead: false,
+            }))
+        }
     }
 }

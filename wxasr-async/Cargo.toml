@@ -2,13 +2,14 @@
 name = "wxasr-async"
 version = "0.1.0"
 edition = "2021"
-description = "wxasr 的异步事件流封装：专用识别线程 + tokio mpsc，上下文轮换与中间结果节流"
+description = "流式 ASR 统一异步层：专用识别线程 + tokio mpsc 事件桥；wxasr 为首个后端（上下文轮换定稿、中间结果节流）"
 license = "MIT"
 
 [dependencies]
 wxasr = { path = "../wxasr" }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 uuid = { version = "1", features = ["v7"] }
+eyre = "0.6.14"
 
 [dev-dependencies]
 hound = "3"

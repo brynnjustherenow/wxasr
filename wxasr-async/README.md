@@ -1,9 +1,14 @@
 # wxasr-async
 
-[wxasr](../wxasr) 的异步事件流封装：一个专用识别线程拥有 `Stream`
-（中间结果节流 + 上下文轮换定稿），tokio mpsc 桥接事件，async 侧只做分发。
+流式 ASR 的统一异步层：一个专用识别线程驱动后端会话（中间结果节流 +
+上下文轮换定稿），tokio mpsc 桥接事件，async 侧只做分发。
+[wxasr](../wxasr) 是第一个后端，经 `start` 开箱即用；其他后端实现
+`AsrBackend`/`AsrSession` 后经 `start_with` 接入，与 wxasr 共享同一套
+线程/通道桥与事件流。
 
 ## 用法
+
+wxasr 后端：
 
 ```rust
 use wxasr_async::{start, AsrEvent, Config};
@@ -24,11 +29,17 @@ while let Some(ev) = rx.recv().await {
 // 通道关闭 = 会话结束，transcript 即完整转写
 ```
 
+其他后端把 `start` 换成 `start_with(backend, cfg)` 即可，事件流不变；
+后端专属配置放后端自身的构造参数，不进 `Config`。
+
 ## 配置
+
+`rotate`/`partial`/`partial_min_fresh` 是会话语义，由 wxasr 后端解释；
+`event_capacity`/`thread_name` 属统一层，与后端无关：
 
 ```rust
 Config {
-    rotate: RotatePolicy::Auto { soft_ms: 15_000, hard_ms: 20_000 }, // 上下文轮换策略
+    rotate: RotatePolicy::Punct { soft_ms: 10_000, hard_ms: 20_000 }, // 上下文轮换策略（默认）
     partial: true,          // 是否产生中间结果
     partial_min_fresh: 30,  // 中间结果最小新增帧数（10ms/帧）
     event_capacity: 64,     // 事件通道容量
@@ -44,9 +55,9 @@ Config {
 `Partial` 从空开始（取决于策略）；worker 不保留已定稿文本，资源占用与会话总长无关。
 完整转写 = 顺序拼接所有 `Final`。
 
-- `Auto { soft_ms, hard_ms }`（默认 15s/20s）：软上限到达后于下一次
+- `Auto { soft_ms, hard_ms }`：软上限到达后于下一次
   ≥500ms 静音处轮换；硬上限到达则说话中也强制轮换。
-- `Punct { soft_ms, hard_ms }`：标点触发——软上限到达后，出现下一个
+- `Punct { soft_ms, hard_ms }`（默认 10s/20s）：标点触发——软上限到达后，出现下一个
   已定稿标点即轮换，切点取在标点之后。标点是模型自己的断句信号，
   `Final` 以 `。，？` 等收尾，适合「一句一行」的上屏(无特殊需求推荐使用这个)；
 - `Never`：永不轮换，状态随会话线性增长
@@ -67,7 +78,7 @@ Config {
 ## 线程模型
 
 ```
-采集回调(同步) ──std mpsc(无界)──▶ wxasr-worker 线程 ──tokio mpsc(有界)──▶ async 消费
+采集回调(同步) ──std mpsc(无界)──▶ 识别线程(后端会话) ──tokio mpsc(有界)──▶ async 消费
 ```
 
 识别线程默认名 `wxasr-<uuidv7>`，可用

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use wxasr::Model;
-use wxasr_async::{start, policy::RotatePolicy, AsrEvent, Config};
+use wxasr_async::{policy::RotatePolicy, start, AsrEvent, Config};
 
 fn load_model() -> Option<Arc<Model>> {
     let dir = std::env::var("WXASR_MODEL")
@@ -48,8 +48,8 @@ fn cer(reference: &str, hypothesis: &str) -> f64 {
     for (i, row) in dp.iter_mut().enumerate() {
         row[0] = i as u32;
     }
-    for j in 0..=h.len() {
-        dp[0][j] = j as u32;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j as u32;
     }
     for i in 1..=r.len() {
         for j in 1..=h.len() {
@@ -213,7 +213,10 @@ async fn hard_rotation_mid_speech_stays_accurate() {
         "硬切 {finals} 段，CER {:.1}%\n  结果: {got}\n  参考: {refs}",
         cer(&refs, &got) * 100.0
     );
-    assert!(finals >= 4, "18s 音频按 3s 硬切应产生多个 Final，实际 {finals}");
+    assert!(
+        finals >= 4,
+        "18s 音频按 3s 硬切应产生多个 Final，实际 {finals}"
+    );
     assert!(
         cer(&refs, &got) < 0.1,
         "CER {:.1}% 超阈值",
@@ -231,7 +234,10 @@ async fn punct_policy_finals_end_with_punctuation() {
     let gap = vec![0i16; 1600 * 16];
     let mut pcm = Vec::new();
     let mut refs = String::new();
-    for (i, c) in ["tts_short_1", "tts_short_2", "tts_short_3"].iter().enumerate() {
+    for (i, c) in ["tts_short_1", "tts_short_2", "tts_short_3"]
+        .iter()
+        .enumerate()
+    {
         if i > 0 {
             pcm.extend_from_slice(&gap);
         }
@@ -273,10 +279,7 @@ async fn punct_policy_finals_end_with_punctuation() {
 
     assert!(finals.len() >= 3, "应按标点切出多段: {finals:?}");
     for f in &finals[..finals.len() - 1] {
-        assert!(
-            f.ends_with(PUNCT),
-            "标点触发的 Final 应以标点收尾: {f:?}"
-        );
+        assert!(f.ends_with(PUNCT), "标点触发的 Final 应以标点收尾: {f:?}");
     }
     assert!(
         cer(&refs, &got) < 0.15,

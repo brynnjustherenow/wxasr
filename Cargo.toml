@@ -2,5 +2,6 @@
 members = [
     "wxasr",
     "wxasr-async",
-    'wxasr-provider'
+    'wxasr-provider',
+    "hex-asr",
 ]
