@@ -36,7 +36,7 @@
 //!     .finish(Some(stream), whole_clip)?
 //!     .wait()
 //!     .map_err(|reason| eyre::eyre!("{reason}"))?;
-//! println!("{}", transcribed.text);
+//! println!("{}", transcribed.text());
 //!
 //! // Or transcribe a whole clip at once.
 //! let transcribed = engine.transcribe_clip(vec![0.0_f32; 48_000])?.wait().unwrap();

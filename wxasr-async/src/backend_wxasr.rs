@@ -32,7 +32,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::policy::{RotateCtx, RotatePolicy};
-use crate::{AsrBackend, AsrEvent, AsrEvents, AsrSession, Config};
+use crate::preprocess::InputConverter;
+use crate::{AsrBackend, AsrEvent, AsrEvents, AsrSession, AsrText, AudioIn, Config};
 use wxasr::{Model, Stream};
 
 /// wxasr 后端:每次 [`open`](AsrBackend::open) 从共享的 `Arc<Model>`
@@ -49,9 +50,14 @@ impl WxasrBackend {
 }
 
 impl AsrBackend for WxasrBackend {
-    fn open(&self, cfg: &Config) -> eyre::Result<Box<dyn AsrSession>> {
+    fn open(&self, cfg: &Config, audio: AudioIn) -> eyre::Result<Box<dyn AsrSession>> {
+        // wxasr 只吃 16 kHz 单声道:调用方声明的格式在这里转换。
+        // 16 kHz 单声道直通,与历史行为逐字节一致。
+        let convert = InputConverter::new(audio)
+            .map_err(|reason| eyre::eyre!("wxasr 不支持该音频格式: {reason}"))?;
         Ok(Box::new(WxasrStream {
             stream: Some(self.model.stream()),
+            convert,
             vad: Vad::default(),
             quiet_ms: 0,  // 音频尾部连续静音(描述音频,轮换不清零)
             stream_ms: 0, // 当前流累计音频
@@ -72,6 +78,8 @@ pub struct WxasrStream {
     /// `Stream`,轮换时经此 `Option` 换出换入;`finish` 后为 `None`
     /// (会话已结束,后续 `push` 空转)
     stream: Option<Stream>,
+    /// 调用方格式 → 16 kHz 单声道(直通时零开销)
+    convert: InputConverter,
     vad: Vad,
     /// 音频尾部连续静音(描述音频,轮换不清零)
     quiet_ms: u32,
@@ -90,6 +98,12 @@ impl AsrSession for WxasrStream {
         let Some(stream) = self.stream.as_mut() else {
             return;
         };
+        // 调用方格式 → 16 kHz 单声道;攒重采样块时可能暂无输出
+        let converted = self.convert.push(pcm);
+        if converted.is_empty() {
+            return;
+        }
+        let pcm: &[i16] = &converted;
         let ms = pcm.len() as u32 / 16; // 16000 Hz → 16 样本/ms
         self.quiet_ms = if self.vad.is_speech(pcm) {
             0
@@ -110,7 +124,7 @@ impl AsrSession for WxasrStream {
             self.last_emit = Instant::now();
             if !p.is_empty() && p != self.last_partial {
                 self.last_partial = p.clone();
-                if !out.emit(AsrEvent::Partial(p)) {
+                if !out.emit(AsrEvent::Partial(AsrText::plain(p))) {
                     return; // 消费端已关闭
                 }
             }
@@ -137,19 +151,26 @@ impl AsrSession for WxasrStream {
                 if !text.is_empty() {
                     // 消费端已关闭(返回 false)也到此为止——这已是 push 的
                     // 最后一步;旧版 worker 此处 return,效果相同
-                    let _ = out.emit(AsrEvent::Final(text));
+                    let _ = out.emit(AsrEvent::Final(AsrText::plain(text)));
                 }
             }
         }
     }
 
     fn finish(&mut self, out: &mut dyn AsrEvents) {
+        // 重采样残留先送进流,再定稿(不再参与轮换判定)
+        let tail = self.convert.flush();
+        if !tail.is_empty() {
+            if let Some(stream) = self.stream.as_mut() {
+                stream.push(&tail);
+            }
+        }
         let Some(stream) = self.stream.take() else {
             return;
         };
         let text = stream.finish();
         if !text.is_empty() {
-            let _ = out.emit(AsrEvent::Final(text)); // 消费端已关闭也忽略
+            let _ = out.emit(AsrEvent::Final(AsrText::plain(text))); // 消费端已关闭也忽略
         }
     }
 }

@@ -76,7 +76,7 @@ fn transcript(events: &[AsrEvent]) -> String {
     events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Final(t) => Some(t.as_str()),
+            AsrEvent::Final(t) => Some(t.content.as_str()),
             _ => None,
         })
         .collect()
@@ -149,10 +149,10 @@ async fn rotation_keeps_transcript_intact() {
     let events = tokio::time::timeout(Duration::from_secs(120), drain(rx))
         .await
         .expect("超时");
-    let finals: Vec<&String> = events
+    let finals: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Final(t) => Some(t),
+            AsrEvent::Final(t) => Some(t.content.as_str()),
             _ => None,
         })
         .collect();
@@ -263,10 +263,10 @@ async fn punct_policy_finals_end_with_punctuation() {
     let events = tokio::time::timeout(Duration::from_secs(120), drain(rx))
         .await
         .expect("超时");
-    let finals: Vec<&String> = events
+    let finals: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Final(t) => Some(t),
+            AsrEvent::Final(t) => Some(t.content.as_str()),
             _ => None,
         })
         .collect();
@@ -309,10 +309,10 @@ async fn realtime_feed_produces_partials() {
         .expect("超时");
     feeder.await.unwrap();
 
-    let partials: Vec<&String> = events
+    let partials: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Partial(t) => Some(t),
+            AsrEvent::Partial(t) => Some(t.content.as_str()),
             _ => None,
         })
         .collect();
@@ -320,7 +320,7 @@ async fn realtime_feed_produces_partials() {
     println!(
         "{} 个中间结果，首个: {}",
         partials.len(),
-        partials.first().map(|s| s.as_str()).unwrap_or("")
+        partials.first().copied().unwrap_or("")
     );
     println!("Final: {final_text}");
     assert!(!partials.is_empty(), "实时节奏下应有中间结果");
@@ -355,7 +355,7 @@ async fn two_streams_share_one_model() {
         let mut text = String::new();
         while let Some(ev) = rx.recv().await {
             if let AsrEvent::Final(t) = ev {
-                text += &t;
+                text += &t.content;
             }
         }
         feeder.await.unwrap();

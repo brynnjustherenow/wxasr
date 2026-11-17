@@ -2,18 +2,27 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptSegment {
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
+    /// 1-based speaker attribution, when the model gives one; `None` when it
+    /// does not (no diarization, or no attribution for this span).
+    #[serde(default)]
+    pub speaker: Option<u32>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transcript {
     pub text: String,
+    /// The model-detected language (ISO code), when it predicted one.
+    /// `None` when a language hint was given, the model lacks language
+    /// detection, or no language applies.
+    #[serde(default)]
+    pub language: Option<String>,
     pub segments: Vec<TranscriptSegment>,
     /// Word timings, when the model produces them.
     #[serde(default)]

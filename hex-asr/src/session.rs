@@ -36,16 +36,17 @@ use std::sync::Arc;
 use crate::engine::{Engine, LiveStream};
 
 /// One recognition event, as a session reports it through a
-/// [`SessionEvents`] sink. Mirrors the unified layer's `Partial(String)` /
-/// `Final(String)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`SessionEvents`] sink. Mirrors the unified layer's event payloads.
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionEvent {
     /// The current segment's provisional text (the stream's committed
     /// prefix plus its volatile hypothesis). Only while recording; never
     /// pasted or kept by the caller.
     Partial(String),
-    /// The one finalized text of this session's complete clip.
-    Final(String),
+    /// The one finalized result of this session's complete clip: text,
+    /// the model-detected language when it predicted one, and any
+    /// segment/word timings it produced. A stream finish carries text only.
+    Final(crate::Transcript),
 }
 
 /// A session's event exit, provided by the driver. `emit` returns `false`
@@ -138,9 +139,9 @@ impl StreamingSession {
         };
         match pending.wait() {
             Ok(transcribed) => {
-                let text = transcribed.text.trim();
-                if !text.is_empty() {
-                    out.emit(SessionEvent::Final(text.to_string()));
+                let transcript = transcribed.transcript;
+                if !transcript.text.trim().is_empty() {
+                    out.emit(SessionEvent::Final(transcript));
                 }
             }
             Err(reason) => {

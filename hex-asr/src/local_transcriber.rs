@@ -355,7 +355,7 @@ impl LocalTranscriber {
 
     /// Transcribes a complete 16 kHz clip, padded as a dictation's clip is:
     /// the minimum duration, then the model's trailing silence.
-    pub fn transcribe_clip(&mut self, mut samples: Vec<f32>) -> Result<String> {
+    pub fn transcribe_clip(&mut self, mut samples: Vec<f32>) -> Result<Transcript> {
         crate::pad_gguf_samples(&mut samples, self.spec.trailing_silence_samples);
         self.transcribe(&samples)
     }
@@ -501,14 +501,17 @@ impl LocalTranscriber {
             timestamps: self.finest_timestamps,
             ..self.options.clone()
         };
-        let span = |offset: i64, t0: i64, t1: i64, text: String| {
+        let span = |offset: i64, t0: i64, t1: i64, text: String, speaker: Option<u32>| {
             let text = text.trim().to_owned();
             (!text.is_empty()).then(|| crate::transcript::TranscriptSegment {
                 start_ms: t0.max(0) + offset,
                 end_ms: t1.max(t0) + offset,
                 text,
+                speaker,
             })
         };
+        let speaker =
+            |id: i32| (id > 0).then_some(u32::try_from(id).expect("speaker ids are small"));
         let mut timed = Transcript::default();
         let mut texts = Vec::new();
         for range in chunk_ranges(samples, chunk) {
@@ -521,24 +524,27 @@ impl LocalTranscriber {
             if !text.is_empty() {
                 texts.push(text.to_owned());
             }
+            if timed.language.is_none() {
+                timed.language = transcript.language;
+            }
             timed.segments.extend(
                 transcript
                     .segments
                     .into_iter()
-                    .filter_map(|s| span(offset, s.t0_ms, s.t1_ms, s.text)),
+                    .filter_map(|s| span(offset, s.t0_ms, s.t1_ms, s.text, speaker(s.speaker_id))),
             );
             timed.words.extend(
                 transcript
                     .words
                     .into_iter()
-                    .filter_map(|w| span(offset, w.t0_ms, w.t1_ms, w.text)),
+                    .filter_map(|w| span(offset, w.t0_ms, w.t1_ms, w.text, None)),
             );
         }
         timed.text = texts.join(" ");
         Ok(timed)
     }
 
-    pub fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
+    pub fn transcribe(&mut self, samples: &[f32]) -> Result<Transcript> {
         let run = |this: &mut Self| {
             this.session
                 .transcribe_chunked(samples, &this.options, this.max_audio_samples)

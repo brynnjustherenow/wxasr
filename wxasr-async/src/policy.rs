@@ -157,14 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn default_is_auto_15s_20s() {
-        let p = RotatePolicy::default();
-        assert!(!p.should_rotate(&ctx(14_999, 60_000)));
-        assert!(p.should_rotate(&ctx(15_000, 500)));
-        assert!(p.should_rotate(&ctx(20_000, 0)));
-    }
-
-    #[test]
     fn punct_triggers_only_after_soft_limit() {
         let p = RotatePolicy::Punct {
             soft_ms: 3000,

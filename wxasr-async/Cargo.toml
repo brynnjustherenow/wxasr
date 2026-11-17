@@ -10,6 +10,13 @@ wxasr = { path = "../wxasr" }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 uuid = { version = "1", features = ["v7"] }
 eyre = "0.6.14"
+rubato = "5.0.1"
+hex-asr = { path = "../hex-asr", optional = true }
+
+[features]
+# hex-asr 后端(transcribe-cpp GGUF 推理栈):默认不开,启用需要
+# CMake + Vulkan SDK 的构建环境(见 hex-asr 的文档)
+hex = ["dep:hex-asr"]
 
 [dev-dependencies]
 hound = "3"

@@ -251,10 +251,10 @@ fn transcribes_a_speech_wav_end_to_end() {
         std::env::var("HEXASR_MODEL").as_deref().unwrap_or("?"),
         std::env::var("HEXASR_DEVICE").unwrap_or_default(),
         started.elapsed().as_millis(),
-        transcribed.text
+        transcribed.text()
     );
     assert!(
-        !transcribed.text.trim().is_empty(),
+        !transcribed.text().trim().is_empty(),
         "a speech clip must transcribe to text"
     );
 }

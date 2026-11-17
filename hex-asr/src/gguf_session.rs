@@ -323,7 +323,7 @@ impl OfflineGgufSession {
         samples: &[f32],
         options: &transcribe_cpp::RunOptions,
         max_audio_samples: Option<usize>,
-    ) -> Result<String> {
+    ) -> Result<Transcript> {
         let (audio, _) = self.whisper_audio(samples);
         let samples = audio.as_ref();
         let Some(max_samples) =
@@ -331,10 +331,12 @@ impl OfflineGgufSession {
         else {
             return self
                 .run(samples, options)
-                .map(|transcript| transcript.text)
+                .map(|transcript| timed(transcript, 0))
                 .context("transcription failed");
         };
         let mut output = Vec::new();
+        // Whisper detects per chunk; the first detection names the clip.
+        let mut language = None;
         for range in chunk_ranges(samples, max_samples) {
             let samples = &samples[range];
             if job_cancel().is_some_and(|cancel| cancel.is_cancelled()) {
@@ -354,8 +356,15 @@ impl OfflineGgufSession {
             if !text.is_empty() {
                 output.push(text.to_string());
             }
+            if language.is_none() {
+                language = transcript.language;
+            }
         }
-        Ok(output.join(" "))
+        Ok(Transcript {
+            text: output.join(" "),
+            language,
+            ..Default::default()
+        })
     }
 
     /// [`Self::transcribe_chunked`] with the model's own segment and word
@@ -411,9 +420,11 @@ impl OfflineGgufSession {
 /// A whole clip's segments and words, from its single run.
 fn timed(transcript: transcribe_cpp::Transcript, offset_ms: i64) -> Transcript {
     let text = transcript.text.clone();
+    let language = transcript.language.clone();
     let spans = timed_spans(transcript, offset_ms);
     Transcript {
         text,
+        language,
         segments: spans.segments,
         words: spans.words,
     }
@@ -520,25 +531,35 @@ fn chunk_offset_ms(trim_start: usize, chunk_start: usize) -> i64 {
 }
 
 fn timed_spans(transcript: transcribe_cpp::Transcript, offset_ms: i64) -> Transcript {
-    let span = |start_ms: i64, end_ms: i64, text: String| {
+    let span = |start_ms: i64, end_ms: i64, text: String, speaker: Option<u32>| {
         let text = text.trim().to_owned();
         let start_ms = start_ms.max(0);
         (!text.is_empty()).then(|| TranscriptSegment {
             start_ms: start_ms.saturating_add(offset_ms),
             end_ms: end_ms.max(start_ms).saturating_add(offset_ms),
             text,
+            speaker,
         })
     };
+    // `speaker_id` is 1-based; zero means the model attributed no speaker.
+    let speaker = |id: i32| (id > 0).then_some(u32::try_from(id).expect("speaker ids are small"));
     Transcript {
         segments: transcript
             .segments
             .into_iter()
-            .filter_map(|segment| span(segment.t0_ms, segment.t1_ms, segment.text))
+            .filter_map(|segment| {
+                span(
+                    segment.t0_ms,
+                    segment.t1_ms,
+                    segment.text,
+                    speaker(segment.speaker_id),
+                )
+            })
             .collect(),
         words: transcript
             .words
             .into_iter()
-            .filter_map(|word| span(word.t0_ms, word.t1_ms, word.text))
+            .filter_map(|word| span(word.t0_ms, word.t1_ms, word.text, None))
             .collect(),
         ..Default::default()
     }

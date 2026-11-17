@@ -24,13 +24,14 @@ use eyre::{Result, eyre};
 use transcribe_cpp::CancelToken;
 
 use crate::local_transcriber::{Device, LocalTranscriber, ModelSpec};
+use crate::transcript::Transcript;
 use streaming::*;
 
 /// The model the engine owns: the one local GGUF model.
 pub(crate) type Model = LocalTranscriber;
 
 /// Transcribes a complete 16 kHz clip offline on the engine thread.
-pub type Offline = Box<dyn FnOnce(&mut Model, Vec<f32>) -> Result<String, String> + Send>;
+pub type Offline = Box<dyn FnOnce(&mut Model, Vec<f32>) -> Result<Transcript, String> + Send>;
 
 /// Low-priority work on the model. It receives `None` instead of the model
 /// when a dictation-class request claimed the engine first.
@@ -319,10 +320,20 @@ enum Reply {
 
 #[derive(Debug)]
 pub struct Transcribed {
-    pub text: String,
+    /// The full result: text, detected language, and any segment/word timings
+    /// the model produced. A stream finish carries text only (the streaming
+    /// API reports text diffs, not rows).
+    pub transcript: Transcript,
     pub source: Source,
     /// Time from the finish request to the final text.
     pub finish_ms: u64,
+}
+
+impl Transcribed {
+    /// The final text, trimmed.
+    pub fn text(&self) -> &str {
+        self.transcript.text.trim()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1022,7 +1033,10 @@ impl Worker {
                 );
                 match result {
                     Ok(text) => job.finish(Ok(Transcribed {
-                        text,
+                        transcript: Transcript {
+                            text,
+                            ..Transcript::default()
+                        },
                         source: Source::Stream,
                         finish_ms: started.elapsed().as_millis() as u64,
                     })),
@@ -1087,10 +1101,13 @@ impl Worker {
         self.running.enter(&job.cancel);
         let result =
             crate::gguf_session::with_job_cancel(&job.cancel, || offline(&mut self.model, clip))
-                .map(|text| Transcribed {
-                    text: text.trim().to_string(),
-                    source,
-                    finish_ms: started.elapsed().as_millis() as u64,
+                .map(|mut transcript| {
+                    transcript.text = transcript.text.trim().to_string();
+                    Transcribed {
+                        transcript,
+                        source,
+                        finish_ms: started.elapsed().as_millis() as u64,
+                    }
                 });
         job.finish(result);
     }
@@ -1121,7 +1138,7 @@ mod tests {
             .finish_with(
                 Some(finished),
                 vec![0.0; 7],
-                Box::new(|_, _| Ok(String::new())),
+                Box::new(|_, _| Ok(Transcript::default())),
             )
             .unwrap();
         assert!(pending.stream_cancel.is_some());
@@ -1196,7 +1213,7 @@ mod tests {
         ));
         stream.feed(&[0.1; 4]);
         let chunk = engine
-            .foreground(vec![0.0; 9], Box::new(|_, _| Ok("chunk".into())))
+            .foreground(vec![0.0; 9], Box::new(|_, _| Ok(text_transcript("chunk"))))
             .unwrap();
         stream.feed(&[0.2; 4]);
         let dictation = engine
@@ -1225,7 +1242,7 @@ mod tests {
         assert_eq!(result, Ok("streamed 8".to_string()));
         assert_eq!(fake.fed.len(), 8);
         job.finish(Ok(Transcribed {
-            text: "streamed 8".into(),
+            transcript: text_transcript("streamed 8"),
             source: Source::Stream,
             finish_ms: 0,
         }));
@@ -1824,7 +1841,7 @@ mod tests {
         stream.feed(&[0.1; 4]);
         let generation = engine.requests.load(Ordering::Acquire);
         let _chunk = engine
-            .foreground(vec![0.0; 3], Box::new(|_, _| Ok("chunk".into())))
+            .foreground(vec![0.0; 3], Box::new(|_, _| Ok(text_transcript("chunk"))))
             .unwrap();
         assert_eq!(
             engine.requests.load(Ordering::Acquire),
@@ -1893,7 +1910,15 @@ mod tests {
     };
 
     fn silent() -> Offline {
-        Box::new(|_, _| Ok(String::new()))
+        Box::new(|_, _| Ok(Transcript::default()))
+    }
+
+    /// A transcript of just text, as a test's offline run returns.
+    fn text_transcript(text: &str) -> Transcript {
+        Transcript {
+            text: text.into(),
+            ..Transcript::default()
+        }
     }
 
     /// Takes the next finish the test engine would have run.
@@ -1937,12 +1962,12 @@ mod tests {
             thread::sleep(SHORT.job * 3);
             job.start();
             job.finish(Ok(Transcribed {
-                text: "late but fine".into(),
+                transcript: text_transcript("late but fine"),
                 source: Source::Offline,
                 finish_ms: 0,
             }));
         });
-        assert_eq!(pending.wait().unwrap().text, "late but fine");
+        assert_eq!(pending.wait().unwrap().text(), "late but fine");
         worker.join().unwrap();
     }
 

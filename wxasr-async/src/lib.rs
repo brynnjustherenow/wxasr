@@ -22,6 +22,16 @@
 //!   (空文本不发)。之后的 `Partial` 从空开始
 //! - 通道关闭(`recv` 返回 `None`)表示会话结束
 //!
+//! 事件载荷是 [`AsrText`]:除 `content` 外的字段按模型能力填充,
+//! 不支持为 `None`/空(wxasr 后端只填 `content`)。
+//!
+//! # 音频格式
+//!
+//! 音频格式由调用方在 [`start_with`] 声明([`AudioIn`]),之后所有
+//! [`AsrHandle::push`] 的 PCM 都按此解释——统一层不写死采样率,
+//! 降混与重采样在各后端内部完成,调用方无感。16 kHz 单声道
+//! ([`AudioIn::MONO_16K`])零转换直通。
+//!
 //! 完整转写 = 按顺序拼接所有 `Final`。
 //!
 //! # 入门
@@ -31,13 +41,13 @@
 //! use wxasr_async::{start, AsrEvent};
 //!
 //! let (handle, mut rx) = start(model, Default::default());
-//! handle.push(mic_pcm);           // 采集回调里喂 16kHz 单声道 i16
+//! handle.push(mic_pcm);           // 采集回调里喂声明的格式(默认 16kHz 单声道 i16)
 //! handle.finish();                // 结束识别
 //!
 //! while let Some(ev) = rx.recv().await {
 //!     match ev {
 //!         AsrEvent::Partial(t) => { /* 当前段边说边显 */ }
-//!         AsrEvent::Final(t) => println!("{t}"), // 一段定稿
+//!         AsrEvent::Final(t) => println!("{}", t.content), // 一段定稿
 //!     }
 //! }
 //! // 通道关闭:会话结束
@@ -49,18 +59,89 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use wxasr::Model;
+#[cfg(feature = "hex")]
+pub mod backend_hex;
 pub mod backend_wxasr;
 pub mod policy;
+pub mod preprocess;
 use policy::RotatePolicy;
+
+/// 词级时间戳:毫秒相对会话起点,`end_ms ≥ start_ms`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrWord {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+/// 一条分段:时间戳加可选的说话人归属
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrSegment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+    /// 1-based 说话人编号;模型未归属(或无 diarization)→ `None`
+    pub speaker: Option<u32>,
+}
+
+/// 一次识别结果,[`AsrEvent::Partial`] 与 [`AsrEvent::Final`] 共用。
+///
+/// 除 `content` 外的字段按模型能力填充:模型(或后端)不支持时为
+/// `None`/空——wxasr 后端只填 `content`。`Partial` 通常也只有
+/// `content`(中间结果是文本增量);语言/时间戳在 `Final` 到齐
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AsrText {
+    /// 识别文本,唯一必填字段
+    pub content: String,
+    /// 模型自报的语言(ISO code);无语言识别 → `None`
+    pub language: Option<String>,
+    /// 整段归属的说话人(1-based);无归属或混合 → `None`
+    pub speaker: Option<u32>,
+    /// 分段(时间戳 + 可选说话人);模型不给 → 空
+    pub segments: Vec<AsrSegment>,
+    /// 词级时间戳;模型不给 → 空
+    pub words: Vec<AsrWord>,
+}
+
+impl AsrText {
+    /// 只有文本的结果,不支持富字段的后端用
+    pub fn plain(content: impl Into<String>) -> Self {
+        AsrText {
+            content: content.into(),
+            ..AsrText::default()
+        }
+    }
+}
+
 /// 识别事件(按时间顺序产生)
 #[derive(Debug, Clone)]
 pub enum AsrEvent {
     /// 当前段的中间结果(已节流,仅当开启 `Config::partial`);
     /// 每次 [`Final`](Self::Final) 之后从空开始
-    Partial(String),
+    Partial(AsrText),
     /// 一段定稿:上下文轮换时、以及结束时的最后一段各产生一个(空文本
     /// 不发)。不是关闭事件——会话结束以通道关闭为准
-    Final(String),
+    Final(AsrText),
+}
+
+/// 调用方音频的格式:会话创建时声明一次,之后所有
+/// [`AsrHandle::push`] 的 PCM 都按此解释(交错 i16)。
+///
+/// 统一层不写死采样率:各后端在内部降混/重采样成自己需要的格式,
+/// 调用方无感;16 kHz 单声道零转换直通
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioIn {
+    pub sample_rate: u32,
+    /// 声道数(交错存储)
+    pub channels: u16,
+}
+
+impl AudioIn {
+    /// 16 kHz 单声道,历史默认(wxasr 原生格式,直通)
+    pub const MONO_16K: AudioIn = AudioIn {
+        sample_rate: 16_000,
+        channels: 1,
+    };
 }
 
 /// 会话的事件出口,由统一 worker 提供给后端。
@@ -76,7 +157,8 @@ pub trait AsrEvents {
 /// 持有全部会话语义(中间结果节流、轮换/定稿、兜底),不进 async
 /// 执行器
 pub trait AsrSession: Send {
-    /// 喂 16kHz 单声道 i16,任意块大小
+    /// 喂 [`AudioIn`] 所声明格式的 i16 PCM(交错,任意块大小);
+    /// 后端已在内部转换成自己需要的格式
     fn push(&mut self, pcm: &[i16], out: &mut dyn AsrEvents);
     /// 定稿最后一段并结束(空文本不发事件)
     fn finish(&mut self, out: &mut dyn AsrEvents);
@@ -84,9 +166,10 @@ pub trait AsrSession: Send {
 
 /// ASR 后端:为每次启动创建一个 [`AsrSession`]
 pub trait AsrBackend: Send + Sync {
-    /// 在识别线程内调用。失败时会话立即结束:事件通道关闭、不产生
-    /// 任何事件(消费端看到空会话)
-    fn open(&self, cfg: &Config) -> eyre::Result<Box<dyn AsrSession>>;
+    /// 在识别线程内调用。`audio` 是调用方声明的音频格式,会话的
+    /// [`AsrSession::push`] 按它解释,后端自行降混/重采样。失败时
+    /// 会话立即结束:事件通道关闭、不产生任何事件(消费端看到空会话)
+    fn open(&self, cfg: &Config, audio: AudioIn) -> eyre::Result<Box<dyn AsrSession>>;
 }
 
 /// 运行配置。
@@ -137,8 +220,8 @@ pub struct AsrHandle {
 }
 
 impl AsrHandle {
-    /// 喂入一段 16kHz 单声道 i16 PCM(任意块大小)。
-    /// 同步、非阻塞、不丢数据,可直接在采集回调里调用。
+    /// 喂入一段 i16 PCM(任意块大小),按 [`start_with`] 时声明的
+    /// [`AudioIn`] 解释。同步、非阻塞、不丢数据,可直接在采集回调里调用。
     pub fn push(&self, pcm: &[i16]) {
         let _ = self.tx.send(AudioMsg::Pcm(pcm.to_vec()));
     }
@@ -151,19 +234,25 @@ impl AsrHandle {
 }
 
 /// 用 wxasr 后端启动识别(等价于
-/// `start_with(Box::new(WxasrBackend::new(model)), cfg)`)。返回(喂入端,事件流)。
+/// `start_with(Box::new(WxasrBackend::new(model)), cfg, AudioIn::MONO_16K)`)。
+/// 返回(喂入端,事件流)。
 ///
 /// 多个识别流可共享同一 `Arc<Model>`:权重与内部计算线程池全局复用,
 /// 每流仅一个 worker 线程与各自的流式状态(特征/VAD)。并发流建议
 /// 通过 [`Config::thread_name`] 各自命名。
 pub fn start(model: Arc<Model>, cfg: Config) -> (AsrHandle, mpsc::Receiver<AsrEvent>) {
-    start_with(Box::new(backend_wxasr::WxasrBackend::new(model)), cfg)
+    start_with(
+        Box::new(backend_wxasr::WxasrBackend::new(model)),
+        cfg,
+        AudioIn::MONO_16K,
+    )
 }
 
 /// 通用入口:用任意 [`AsrBackend`] 启动识别。返回(喂入端,事件流)。
 ///
-/// 统一层 spawn 一个专用识别线程,在其中 `backend.open(&cfg)` 创建会话
-/// 并驱动:音频经 [`AsrHandle::push`] 进,事件经 tokio mpsc 出;
+/// 统一层 spawn 一个专用识别线程,在其中 `backend.open(&cfg, audio)`
+/// 创建会话并驱动:音频经 [`AsrHandle::push`] 进(按 `audio` 声明的
+/// 格式解释,后端内部转换),事件经 tokio mpsc 出;
 /// [`AsrHandle::finish`] 或所有句柄 drop 时调用 [`AsrSession::finish`]
 /// 定稿并关闭事件通道;消费端提前关闭时识别线程停止驱动、直接丢弃
 /// 会话(不定稿)。线程默认名沿用 `wxasr-<uuidv7>`,并发流用
@@ -171,6 +260,7 @@ pub fn start(model: Arc<Model>, cfg: Config) -> (AsrHandle, mpsc::Receiver<AsrEv
 pub fn start_with(
     backend: Box<dyn AsrBackend>,
     cfg: Config,
+    audio: AudioIn,
 ) -> (AsrHandle, mpsc::Receiver<AsrEvent>) {
     let (audio_tx, audio_rx) = std::sync::mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel(cfg.event_capacity);
@@ -181,7 +271,7 @@ pub fn start_with(
     };
     std::thread::Builder::new()
         .name(name)
-        .spawn(move || worker(backend.as_ref(), cfg, audio_rx, event_tx))
+        .spawn(move || worker(backend.as_ref(), cfg, audio, audio_rx, event_tx))
         .expect("识别线程创建失败");
     (AsrHandle { tx: audio_tx }, event_rx)
 }
@@ -189,11 +279,12 @@ pub fn start_with(
 fn worker(
     backend: &dyn AsrBackend,
     cfg: Config,
-    audio: std::sync::mpsc::Receiver<AudioMsg>,
+    audio: AudioIn,
+    audio_in: std::sync::mpsc::Receiver<AudioMsg>,
     out: mpsc::Sender<AsrEvent>,
 ) {
     // open 失败:会话立即结束(通道关闭,不产生事件),见 AsrBackend::open
-    let Ok(mut session) = backend.open(&cfg) else {
+    let Ok(mut session) = backend.open(&cfg, audio) else {
         return;
     };
     let mut sink = EventSink {
@@ -203,7 +294,7 @@ fn worker(
     // 消费端提前关闭:直接丢弃会话、不调用 finish,与旧版 worker
     // blocking_send 出错即 return 的行为一致
     let mut consumer_alive = true;
-    while let Ok(msg) = audio.recv() {
+    while let Ok(msg) = audio_in.recv() {
         let AudioMsg::Pcm(pcm) = msg else { break };
         session.push(&pcm, &mut sink);
         if sink.closed {
@@ -244,7 +335,7 @@ mod tests {
     struct CountBackend;
 
     impl AsrBackend for CountBackend {
-        fn open(&self, _cfg: &Config) -> eyre::Result<Box<dyn AsrSession>> {
+        fn open(&self, _cfg: &Config, _audio: AudioIn) -> eyre::Result<Box<dyn AsrSession>> {
             Ok(Box::new(CountSession {
                 ms: 0,
                 partial_sent: false,
@@ -262,28 +353,29 @@ mod tests {
             self.ms += pcm.len() as u32 / 16;
             if self.ms >= 100 && !self.partial_sent {
                 self.partial_sent = true;
-                out.emit(AsrEvent::Partial("够 100ms 了".into()));
+                out.emit(AsrEvent::Partial(AsrText::plain("够 100ms 了")));
             }
         }
 
         fn finish(&mut self, out: &mut dyn AsrEvents) {
-            out.emit(AsrEvent::Final(format!("{}ms", self.ms)));
+            out.emit(AsrEvent::Final(AsrText::plain(format!("{}ms", self.ms))));
         }
     }
 
     #[test]
     fn start_with_drives_backend_until_handle_finish() {
-        let (handle, mut rx) = start_with(Box::new(CountBackend), Config::default());
+        let (handle, mut rx) =
+            start_with(Box::new(CountBackend), Config::default(), AudioIn::MONO_16K);
         handle.push(&[0i16; 1600]); // 100ms
         handle.finish();
         let ev = rx.blocking_recv();
         assert!(
-            matches!(ev, Some(AsrEvent::Partial(ref t)) if t == "够 100ms 了"),
+            matches!(ev, Some(AsrEvent::Partial(ref t)) if t.content == "够 100ms 了"),
             "应为 Partial,实际 {ev:?}"
         );
         let ev = rx.blocking_recv();
         assert!(
-            matches!(ev, Some(AsrEvent::Final(ref t)) if t == "100ms"),
+            matches!(ev, Some(AsrEvent::Final(ref t)) if t.content == "100ms"),
             "应为 Final,实际 {ev:?}"
         );
         assert!(rx.blocking_recv().is_none()); // 通道关闭 = 会话结束
@@ -291,12 +383,13 @@ mod tests {
 
     #[test]
     fn dropping_all_handles_finishes_session() {
-        let (handle, mut rx) = start_with(Box::new(CountBackend), Config::default());
+        let (handle, mut rx) =
+            start_with(Box::new(CountBackend), Config::default(), AudioIn::MONO_16K);
         handle.push(&[0i16; 320]); // 20ms
         drop(handle);
         let ev = rx.blocking_recv();
         assert!(
-            matches!(ev, Some(AsrEvent::Final(ref t)) if t == "20ms"),
+            matches!(ev, Some(AsrEvent::Final(ref t)) if t.content == "20ms"),
             "应为 Final,实际 {ev:?}"
         );
         assert!(rx.blocking_recv().is_none());
@@ -322,14 +415,14 @@ mod tests {
                 return;
             }
             self.record("push");
-            if !out.emit(AsrEvent::Partial("x".into())) {
+            if !out.emit(AsrEvent::Partial(AsrText::plain("x"))) {
                 self.dead = true;
             }
         }
 
         fn finish(&mut self, out: &mut dyn AsrEvents) {
             self.record("finish");
-            let _ = out.emit(AsrEvent::Final("final".into()));
+            let _ = out.emit(AsrEvent::Final(AsrText::plain("final")));
         }
     }
 
@@ -344,7 +437,11 @@ mod tests {
     #[test]
     fn consumer_close_drops_session_without_finish() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let (handle, rx) = start_with(Box::new(ProbeBackend(log.clone())), Config::default());
+        let (handle, rx) = start_with(
+            Box::new(ProbeBackend(log.clone())),
+            Config::default(),
+            AudioIn::MONO_16K,
+        );
         handle.push(&[0i16; 1600]);
         drop(rx);
         for _ in 0..8 {
@@ -373,7 +470,7 @@ mod tests {
     struct ProbeBackend(Arc<Mutex<Vec<&'static str>>>);
 
     impl AsrBackend for ProbeBackend {
-        fn open(&self, _cfg: &Config) -> eyre::Result<Box<dyn AsrSession>> {
+        fn open(&self, _cfg: &Config, _audio: AudioIn) -> eyre::Result<Box<dyn AsrSession>> {
             Ok(Box::new(ProbeSession {
                 log: self.0.clone(),
                 dead: false,

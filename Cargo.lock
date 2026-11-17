@@ -1603,7 +1603,9 @@ name = "wxasr-async"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "hex-asr",
  "hound",
+ "rubato",
  "tokio",
  "uuid",
  "wxasr",

@@ -14,8 +14,8 @@
 
 ## 红线
 
-- `wxasr-async/src/policy.rs` 冻结:零改动,轮换行为零变化。其存量测试失败
-  `policy::tests::default_is_auto_15s_20s` 保持原样,不要修。
+- `wxasr-async/src/policy.rs` 冻结:轮换行为零变化(用户拍板,默认策略已改
+  为 `Punct{10s,20s}`,断言旧默认的存量测试 `default_is_auto_15s_20s` 已删)。
 - wxasr-async 原有公共接口(`AsrEvent`/`AsrHandle`/`Config`/`start`)只增不破;
   新代码与它们冲突时改新代码一侧。
 - 兼容方向:hex-asr 适配 wxasr-async 契约,不是反过来。
@@ -55,19 +55,30 @@ $env:INCLUDE = "C:\VulkanSDK\1.4.363.0\Include;$env:INCLUDE"
   - `Qwen3-ASR-0.6B-Q8_0.gguf`(811MB)
   - `silero-vad-v6.2-F32.gguf`(1.2MB,VAD)
 - 测试 wav fixtures:`wxasr\tests\data`;wxasr-async 集成测试用仓库内的 `.xnet` 模型。
-- 预期基线:wxasr-async lib 唯一失败是 policy.rs 存量失败,integration 全绿;hex-asr 全绿。
-  Vulkan 加载大模型要几十秒,timeout 放大。
+- 预期基线:wxasr-async lib / integration 全绿(无 feature 19+6;`--features hex`
+  再加 backend_hex 的 2 个映射测试);hex-asr 全绿。Vulkan 加载大模型要几十秒,
+  timeout 放大。whisper-large 只适合 GPU(CPU 推理超 engine 的 job deadline,
+  属设计内快速失败)。
 
 ## 统一层契约摘要
 
 - `AsrEvents::emit(&mut self, ev: AsrEvent) -> bool`:返回 `false` 表示消费端已关闭,
   后端停止后续计算、尽快收尾(再发也会被丢弃)。
-- `AsrSession::push(&mut self, pcm: &[i16], out: &mut dyn AsrEvents)`:16kHz 单声道
-  i16,任意块大小;`finish` 定稿并结束(空文本不发事件)。
-- `AsrBackend::open(&self, cfg: &Config) -> eyre::Result<Box<dyn AsrSession>>`:在识别
-  线程内调用;失败则会话立即结束,消费端看到空会话。
-- 后端专属配置走后端构造参数,不进 `Config`(`rotate`/`partial`/`partial_min_fresh`
-  由 wxasr 后端解释,其他后端可忽略;`event_capacity`/`thread_name` 属统一层)。
-- 事件模型:会话中 `Partial`(投机中间结果),定稿 `Final`;一次 hex 会话恰一个 Final
-  (Hex 语义无轮换),多段 Final 是 wxasr 后端自己的行为。会话结束以通道关闭为准,
-  `Final` 不是关闭事件。
+- `AsrSession::push(&mut self, pcm: &[i16], out: &mut dyn AsrEvents)`:按
+  `AudioIn` 所声明格式的 i16(交错,任意块大小);`finish` 定稿并结束
+  (空文本不发事件)。
+- `AsrBackend::open(&self, cfg: &Config, audio: AudioIn) -> eyre::Result<Box<dyn AsrSession>>`:
+  在识别线程内调用;失败则会话立即结束,消费端看到空会话。
+- 音频格式(`AudioIn { sample_rate, channels }`)由调用方在 `start_with` 声明,
+  统一层不写死采样率:降混/重采样在各后端内部完成(`preprocess::InputConverter`,
+  16 kHz 单声道直通)。后端专属配置走后端构造参数,不进 `Config`
+  (`rotate`/`partial`/`partial_min_fresh` 由 wxasr 后端解释,hex 后端忽略
+  rotate;`event_capacity`/`thread_name` 属统一层)。
+- 事件载荷 `AsrText`:`content` 唯一必填;`language`/`speaker`/`segments`/
+  `words` 按模型能力填,不支持为 `None`/空(wxasr 后端只填 `content`,
+  hex 后端直通富字段)。
+- 事件模型:会话中 `Partial`(投机中间结果),定稿 `Final`;一次 hex 会话
+  恰一个 Final(Hex 语义无轮换),多段 Final 是 wxasr 后端自己的行为。
+  会话结束以通道关闭为准,`Final` 不是关闭事件。
+- wxasr-async 的 `hex` feature 启用 `backend_hex`(hex-asr 后端),编译需要
+  CMake + Vulkan SDK 环境与 hex-asr 相同。

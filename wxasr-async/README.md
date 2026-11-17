@@ -22,15 +22,30 @@ handle.finish();     // 结束识别
 let mut transcript = String::new();
 while let Some(ev) = rx.recv().await {
     match ev {
-        AsrEvent::Partial(t) => { /* 当前段边说边显 */ }
-        AsrEvent::Final(t) => transcript += &t, // 一段定稿（轮换或结束时）
+        AsrEvent::Partial(t) => { /* 当前段边说边显（t.content）*/ }
+        AsrEvent::Final(t) => transcript += &t.content, // 一段定稿（轮换或结束时）
     }
 }
 // 通道关闭 = 会话结束，transcript 即完整转写
 ```
 
-其他后端把 `start` 换成 `start_with(backend, cfg)` 即可，事件流不变；
-后端专属配置放后端自身的构造参数，不进 `Config`。
+事件载荷是 `AsrText`：`content` 之外还有 `language`（模型自报的语言
+识别）、`speaker`/`segments`（说话人归属）、`words`（词级时间戳），
+按模型能力填充，不支持为 `None`/空——wxasr 后端只填 `content`。
+
+其他后端把 `start` 换成 `start_with(backend, cfg, audio)` 即可，事件流
+不变。`audio: AudioIn { sample_rate, channels }` 声明调用方的音频
+格式（默认 16 kHz 单声道直通）：统一层不写死采样率，降混/重采样在
+各后端内部完成。后端专属配置放后端自身的构造参数，不进 `Config`。
+
+内置两个后端：
+
+- `backend_wxasr`（默认，`start` 即它）：微信输入法 `.xnet` 模型，
+  多段 `Final` 上下文轮换
+- `backend_hex`（`--features hex`，需 CMake + Vulkan SDK 构建）：
+  GGUF 推理栈（whisper/Qwen 等，Vulkan GPU 优先），一次会话恰一个
+  `Final`，富字段直通（`language` 等）；`HEXASR_MODEL` 门控的集成
+  测试见 `tests/hex_backend.rs`
 
 ## 配置
 
