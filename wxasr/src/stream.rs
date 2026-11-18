@@ -89,7 +89,9 @@ impl Stream {
             x.resize(x.len() + pad, self.fbank.silence());
         }
         let ids = self.model.forward(&x);
-        ids.get((self.cursor - a) / 5..).map(|s| s.to_vec()).unwrap_or_default()
+        ids.get((self.cursor - a) / 5..)
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
     }
 
     /// 定稿一块：解码后截到块尾附近的连续 blank 处，避免字恰好落在
@@ -167,7 +169,10 @@ impl Stream {
         let mut ids = self.decode_all(PAD);
         // 补静音区的输出不对应真实帧，但句末标点常落在这里，先记下
         let real = ((self.frames.len() - self.lead) / 5).min(ids.len());
-        let pad_punct = ids[real..].iter().copied().find(|id| self.punct.contains(id));
+        let pad_punct = ids[real..]
+            .iter()
+            .copied()
+            .find(|id| self.punct.contains(id));
         ids.truncate(real);
         let stable = ((self.cursor - self.lead) / 5).min(ids.len());
         // 末尾连续 blank 够长才算真静音收尾：说话中截断时未说完的字也
@@ -221,7 +226,10 @@ impl Stream {
             } else {
                 self.model.forward(&self.frames)
             };
-            return ids.get(self.lead / 5..).map(|s| s.to_vec()).unwrap_or_default();
+            return ids
+                .get(self.lead / 5..)
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
         }
         let mut ids = std::mem::take(&mut self.committed);
         if self.frames.len() > self.cursor {

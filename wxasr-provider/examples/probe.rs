@@ -22,7 +22,10 @@ fn main() {
     let cfg = dev.default_output_config().expect("读取输出配置失败");
     let rate = cfg.sample_rate().0;
     let ch = cfg.channels();
-    println!("输出设备: {name}  {rate}Hz {ch}ch {:?}", cfg.sample_format());
+    println!(
+        "输出设备: {name}  {rate}Hz {ch}ch {:?}",
+        cfg.sample_format()
+    );
 
     // 1) 播放 440Hz 音（振幅 0.3）
     let mut phase = 0.0f32;
@@ -53,7 +56,11 @@ fn main() {
         &cfg.clone().into(),
         move |d: &[f32], _| {
             t2.fetch_add(d.len() as u64, Ordering::Relaxed);
-            let m = d.iter().map(|v| (v.abs() * 32767.0) as i32).max().unwrap_or(0);
+            let m = d
+                .iter()
+                .map(|v| (v.abs() * 32767.0) as i32)
+                .max()
+                .unwrap_or(0);
             p2.fetch_max(m, Ordering::Relaxed);
         },
         |e| eprintln!("输入流错误: {e}"),
@@ -69,7 +76,11 @@ fn main() {
             let n = total.load(Ordering::Relaxed);
             let p = peak.load(Ordering::Relaxed);
             println!("\nloopback 通路: OK");
-            println!("  {secs}s 收到 {n} 个样本（{:.0}/s，期望约 {}）", n / secs, rate * ch as u32);
+            println!(
+                "  {secs}s 收到 {n} 个样本（{:.0}/s，期望约 {}）",
+                n / secs,
+                rate * ch as u32
+            );
             println!("  峰值 {p}/32767（>2000 说明真的捕获到了播放声）");
         }
         Err(e) => {

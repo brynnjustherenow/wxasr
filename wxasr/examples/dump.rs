@@ -47,5 +47,8 @@ fn main() {
             r.off
         );
     }
-    println!("\n总计：{} f32, {} i8（其中 {q} 条带量化 scale）", f32c, i8c);
+    println!(
+        "\n总计：{} f32, {} i8（其中 {q} 条带量化 scale）",
+        f32c, i8c
+    );
 }

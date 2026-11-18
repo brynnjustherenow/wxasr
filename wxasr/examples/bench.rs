@@ -23,7 +23,9 @@ fn cer(reference: &str, hypothesis: &str) -> f64 {
     for i in 1..=r.len() {
         for j in 1..=h.len() {
             let cost = (r[i - 1] != h[j - 1]) as u32;
-            dp[i][j] = (dp[i - 1][j] + 1).min(dp[i][j - 1] + 1).min(dp[i - 1][j - 1] + cost);
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
         }
     }
     dp[r.len()][h.len()] as f64 / r.len() as f64
@@ -48,11 +50,14 @@ fn main() {
         }
         let txt = s.finish();
         let cost = t.elapsed().as_secs_f64();
-        let name = std::path::Path::new(f).file_stem().unwrap().to_string_lossy();
+        let name = std::path::Path::new(f)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy();
         let sidecar = std::path::Path::new(f).with_extension("txt");
-        let cer_info = std::fs::read_to_string(&sidecar).ok().map(|ref_text| {
-            format!("\tCER {:.1}%", cer(ref_text.trim(), &txt) * 100.0)
-        });
+        let cer_info = std::fs::read_to_string(&sidecar)
+            .ok()
+            .map(|ref_text| format!("\tCER {:.1}%", cer(ref_text.trim(), &txt) * 100.0));
         println!(
             "{name} audio {:.2}s {:.0}ms\t{txt}{}",
             pcm.len() as f64 / 16000.0,

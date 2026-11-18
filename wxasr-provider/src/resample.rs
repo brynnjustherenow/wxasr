@@ -13,7 +13,11 @@ pub struct Resampler {
 
 impl Resampler {
     pub fn new(in_rate: u32, out_rate: u32) -> Self {
-        Self { step: in_rate as f64 / out_rate as f64, t: 0.0, last: 0.0 }
+        Self {
+            step: in_rate as f64 / out_rate as f64,
+            t: 0.0,
+            last: 0.0,
+        }
     }
 
     pub fn push(&mut self, samples: &[f32], out: &mut Vec<i16>) {
@@ -39,11 +43,10 @@ mod tests {
     fn output_count_matches_ratio() {
         // 48k → 16k：1/3 数量；跨块状态连续
         let mut r = Resampler::new(48000, 16000);
-        let input: Vec<f32> = (0..4800)
-            .map(|i| ((i as f32) * 0.01).sin())
-            .collect();
+        let input: Vec<f32> = (0..4800).map(|i| ((i as f32) * 0.01).sin()).collect();
         let mut out = Vec::new();
-        for chunk in input.chunks(713) { // 故意不整除，考验状态
+        for chunk in input.chunks(713) {
+            // 故意不整除，考验状态
             r.push(chunk, &mut out);
         }
         assert!((out.len() as i64 - 1600).abs() <= 2, "len={}", out.len());
@@ -78,10 +81,13 @@ mod tests {
             .collect();
         let mut out = Vec::new();
         r.push(&input, &mut out);
-        let crossings = |x: &[i16]| {
-            x.windows(2).filter(|w| (w[0] >= 0) != (w[1] >= 0)).count()
-        };
-        let expect = crossings(&input.iter().map(|&v| (v * 32767.0) as i16).collect::<Vec<_>>());
+        let crossings = |x: &[i16]| x.windows(2).filter(|w| (w[0] >= 0) != (w[1] >= 0)).count();
+        let expect = crossings(
+            &input
+                .iter()
+                .map(|&v| (v * 32767.0) as i16)
+                .collect::<Vec<_>>(),
+        );
         let got = crossings(&out);
         assert!((got as i64 - expect as i64).abs() < 8, "{got} vs {expect}");
     }

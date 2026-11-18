@@ -42,7 +42,9 @@ fn tables() -> &'static Tables {
         // 40 个中心点在 mel 域 0→mel(8000) 均分，构成 39 个通道的边界
         let mel = |f: f64| 1127.0 * (1.0 + f / 700.0).ln();
         let hi = mel(8000.0);
-        let cf: Vec<f64> = (0..NCH + 1).map(|i| hi * (i + 1) as f64 / (NCH + 1) as f64).collect();
+        let cf: Vec<f64> = (0..NCH + 1)
+            .map(|i| hi * (i + 1) as f64 / (NCH + 1) as f64)
+            .collect();
         let bins = (1..=NFFT / 2)
             .map(|k| {
                 let m = mel(k as f64 * 16000.0 / NFFT as f64);
@@ -109,7 +111,11 @@ fn frame(x: &[i16]) -> [f64; DIM] {
     for n in 0..WIN {
         let v = x[n] as f64;
         energy += v * v;
-        let pe = if n == 0 { v * (1.0 - 0.97) } else { v - 0.97 * x[n - 1] as f64 };
+        let pe = if n == 0 {
+            v * (1.0 - 0.97)
+        } else {
+            v - 0.97 * x[n - 1] as f64
+        };
         re[n] = pe * t.ham[n];
     }
     fft(&mut re, &mut im, &t.tw);
@@ -210,7 +216,9 @@ mod tests {
     fn periodic_signal_converges_to_zero_mean() {
         // 周期 160 的信号使每个窗内容相同；均值收敛后输出应恰为 0
         let pcm: Vec<i16> = (0..8400)
-            .map(|n| (12000.0 * (2.0 * std::f64::consts::PI * (n % 160) as f64 / 160.0).sin()) as i16)
+            .map(|n| {
+                (12000.0 * (2.0 * std::f64::consts::PI * (n % 160) as f64 / 160.0).sin()) as i16
+            })
             .collect();
         let mut fb = Fbank::new();
         let mut out = Vec::new();
@@ -236,11 +244,16 @@ mod tests {
         // 1kHz 正弦（周期 16 样本）：mel 域位置 u = mel(1000)/mel(8000)*40 ≈ 14.1。
         // 注意要用未归一化的原始帧：周期信号经滑动均值归一化后谱形会被抵消
         let pcm: Vec<i16> = (0..8400)
-            .map(|n| (8000.0 * (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 16000.0).sin()) as i16)
+            .map(|n| {
+                (8000.0 * (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 16000.0).sin()) as i16
+            })
             .collect();
         let f = frame(&pcm[0..WIN]);
         let peak = (0..NCH)
-            .fold((0usize, f64::MIN), |b, i| if f[i] > b.1 { (i, f[i]) } else { b })
+            .fold(
+                (0usize, f64::MIN),
+                |b, i| if f[i] > b.1 { (i, f[i]) } else { b },
+            )
             .0;
         // pre-emphasis 会把能量重心略微上移
         assert!((12..=15).contains(&peak), "1kHz 峰值通道 {peak}");

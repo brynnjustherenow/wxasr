@@ -45,9 +45,9 @@ async fn main() {
         render(&mut out, &committed, &live);
         tokio::select! {
             ev = rx.recv() => match ev {
-                Some(AsrEvent::Partial(t)) => live = t,
+                Some(AsrEvent::Partial(t)) => live = t.content,
                 Some(AsrEvent::Final(t)) => {
-                    committed.push(t);
+                    committed.push(t.content);
                     live.clear();
                 }
                 None => break, // 通道关闭：会话结束
@@ -79,15 +79,14 @@ async fn main() {
 fn render(out: &mut impl Write, committed: &[String], live: &str) {
     let (cols, rows) = size().unwrap_or((80, 24));
     let width = cols as usize / 2 - 2;
-    let mut lines: Vec<String> = committed
-        .iter()
-        .map(|l| fmt_line("✅", l, width))
-        .collect();
+    let mut lines: Vec<String> = committed.iter().map(|l| fmt_line("✅", l, width)).collect();
     if !live.is_empty() {
         lines.push(fmt_line("💬", live, width));
     }
     if lines.is_empty() {
-        lines.push(String::from("🎙 实时桌面听写中（播放任意声音即可）… Ctrl+C 退出"));
+        lines.push(String::from(
+            "🎙 实时桌面听写中（播放任意声音即可）… Ctrl+C 退出",
+        ));
     }
     let lines = &lines[lines.len().saturating_sub(rows as usize)..];
     let _ = execute!(out, MoveTo(0, 0), Clear(ClearType::FromCursorDown));

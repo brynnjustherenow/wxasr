@@ -38,8 +38,10 @@ fn spawn_player(wavs: &[String]) -> Option<Player> {
         match hound::WavReader::open(w) {
             Ok(mut r) => {
                 let wav_rate = r.spec().sample_rate;
-                let samples: Vec<f32> =
-                    r.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect();
+                let samples: Vec<f32> = r
+                    .samples::<i16>()
+                    .map(|s| s.unwrap() as f32 / 32768.0)
+                    .collect();
                 let mut out = Vec::new();
                 Resampler::new(wav_rate, rate).push(&samples, &mut out);
                 mono.extend(out.iter().map(|&v| v as f32 / 32767.0));
@@ -70,7 +72,12 @@ fn spawn_player(wavs: &[String]) -> Option<Player> {
         )
         .ok()?;
     stream.play().ok()?;
-    Some(Player { _stream: stream, cursor, total, rate })
+    Some(Player {
+        _stream: stream,
+        cursor,
+        total,
+        rate,
+    })
 }
 
 #[tokio::main]
@@ -131,14 +138,14 @@ async fn main() {
     loop {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(ev)) => match ev {
-                AsrEvent::Partial(p) => println!("… {p}"),
+                AsrEvent::Partial(p) => println!("… {}", p.content),
                 AsrEvent::Final(f) => {
-                    println!("段: {f}");
-                    lines.push(f);
+                    println!("段: {}", f.content);
+                    lines.push(f.content);
                 }
             },
             Ok(None) => break, // 通道关闭：会话结束
-            Err(_) => {}     // 超时继续轮询
+            Err(_) => {}       // 超时继续轮询
         }
         if !stopped && t0.elapsed().as_secs() >= secs {
             capture.stop();

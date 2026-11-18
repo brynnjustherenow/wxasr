@@ -267,10 +267,13 @@ fn rotate_carries_left_context_across_cuts() {
     let Some(model) = load_model() else { return };
     let cases = tts_cases();
     // 优先用长音频（切割次数多，统计更稳）；缺失时拼接三条短音频
-    let (pcm, text) = match cases
-        .iter()
-        .find(|(w, _)| w.file_stem().unwrap().to_str().unwrap().starts_with("tts_long"))
-    {
+    let (pcm, text) = match cases.iter().find(|(w, _)| {
+        w.file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("tts_long")
+    }) {
         Some((wav, text)) => {
             let mut r = hound::WavReader::open(wav).unwrap();
             (
@@ -302,10 +305,7 @@ fn rotate_carries_left_context_across_cuts() {
             (pcm, text)
         }
     };
-    println!(
-        "音频 {:.1}s，参考: {text}",
-        pcm.len() as f64 / 16000.0
-    );
+    println!("音频 {:.1}s，参考: {text}", pcm.len() as f64 / 16000.0);
 
     let mut worst_carry = 0.0f64;
     let mut sum_full = 0.0f64;
@@ -356,7 +356,11 @@ fn rotate_carries_left_context_across_cuts() {
         sum_carry / 6.0 * 100.0,
         sum_full / 6.0 * 100.0
     );
-    assert!(worst_carry < 0.15, "接续流最差 CER {:.1}% 超阈值", worst_carry * 100.0);
+    assert!(
+        worst_carry < 0.15,
+        "接续流最差 CER {:.1}% 超阈值",
+        worst_carry * 100.0
+    );
 }
 
 #[test]

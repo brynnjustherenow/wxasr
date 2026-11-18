@@ -112,7 +112,13 @@ impl Weights<'_> {
                 r.dims
             )));
         }
-        Ok(QW { off: r.off, n, k, s: r.scale.ok_or_else(|| Error::Model(format!("{name} 缺 scale")))? })
+        Ok(QW {
+            off: r.off,
+            n,
+            k,
+            s: r.scale
+                .ok_or_else(|| Error::Model(format!("{name} 缺 scale")))?,
+        })
     }
 
     fn norm(&self, name: &str) -> Result<Norm> {
@@ -149,7 +155,10 @@ impl Model {
         let map = unsafe { Mmap::map(&std::fs::File::open(&xnet_path)?)? };
         #[cfg(unix)]
         let _ = map.advise(memmap2::Advice::WillNeed);
-        let w = Weights { data: &map, recs: xnet::parse(&map)? };
+        let w = Weights {
+            data: &map,
+            recs: xnet::parse(&map)?,
+        };
 
         let mut layers = Vec::with_capacity(LAYERS);
         for i in 0..LAYERS {
@@ -168,7 +177,12 @@ impl Model {
             });
         }
 
-        let vocab_len = w.rec("output_conv.bias")?.dims.first().copied().unwrap_or(0);
+        let vocab_len = w
+            .rec("output_conv.bias")?
+            .dims
+            .first()
+            .copied()
+            .unwrap_or(0);
         let vocab = load_vocab(&dir.join("dict.decoder.utf8.txt"))?;
         if vocab.len() != vocab_len {
             return Err(Error::Model(format!(
@@ -208,7 +222,9 @@ impl Model {
     pub fn forward(&self, x: &[[f32; DIM]]) -> Vec<u32> {
         // 独立小线程池：本负载 4 线程以上收益很小，徒增调度开销
         static POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
-            let n = std::thread::available_parallelism().map_or(2, |n| n.get()).min(4);
+            let n = std::thread::available_parallelism()
+                .map_or(2, |n| n.get())
+                .min(4);
             rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
                 .thread_name(|i| format!("wxasr-{i}"))
@@ -229,52 +245,60 @@ impl Model {
 
         // conv1 5×5, 1→32，时/频各补 2 → [t][32×40]
         let mut y1 = vec![0f32; t * F1 * DIM];
-        y1.par_chunks_mut(F1 * DIM).enumerate().for_each(|(ti, row)| {
-            let mut patch = [[0f32; 25]; DIM];
-            for (f, pf) in patch.iter_mut().enumerate() {
-                for di in 0..5 {
-                    let Some(tt) = at(ti, di as isize - 2).filter(|&v| v < t) else { continue };
-                    for dj in 0..5 {
-                        if let Some(ff) = at(f, dj as isize - 2).filter(|&v| v < DIM) {
-                            pf[di * 5 + dj] = x[tt][ff];
-                        }
-                    }
-                }
-            }
-            for o in 0..F1 {
-                let w = &self.c1[o * 25..o * 25 + 25];
-                for f in 0..DIM {
-                    row[o * DIM + f] = dotf(w, &patch[f]).max(0.0);
-                }
-            }
-        });
-
-        // conv2 7×7, 32→64，时间步长 5（时补 1、频补 3）→ [t1][64×41]
-        // （频率维第 41 列恒为 0，供 conv3 取窗）
-        let mut y2 = vec![0f32; t1 * F2 * W2];
-        y2.par_chunks_mut(F2 * W2).enumerate().for_each(|(ti, row)| {
-            let mut patch = vec![0f32; DIM * K2];
-            for di in 0..7 {
-                let Some(tt) = at(ti * 5 + di, -1).filter(|&v| v < t) else { continue };
-                let src = &y1[tt * F1 * DIM..(tt + 1) * F1 * DIM];
-                for c in 0..F1 {
-                    for f in 0..DIM {
-                        for dj in 0..7 {
-                            let ff = f + dj; // 实际频率 = ff - 3
-                            if (3..DIM + 3).contains(&ff) {
-                                patch[f * K2 + c * 49 + di * 7 + dj] = src[c * DIM + ff - 3];
+        y1.par_chunks_mut(F1 * DIM)
+            .enumerate()
+            .for_each(|(ti, row)| {
+                let mut patch = [[0f32; 25]; DIM];
+                for (f, pf) in patch.iter_mut().enumerate() {
+                    for di in 0..5 {
+                        let Some(tt) = at(ti, di as isize - 2).filter(|&v| v < t) else {
+                            continue;
+                        };
+                        for dj in 0..5 {
+                            if let Some(ff) = at(f, dj as isize - 2).filter(|&v| v < DIM) {
+                                pf[di * 5 + dj] = x[tt][ff];
                             }
                         }
                     }
                 }
-            }
-            for o in 0..F2 {
-                let w = &self.c2[o * K2..(o + 1) * K2];
-                for f in 0..DIM {
-                    row[o * W2 + f] = dotf(w, &patch[f * K2..(f + 1) * K2]).max(0.0);
+                for o in 0..F1 {
+                    let w = &self.c1[o * 25..o * 25 + 25];
+                    for f in 0..DIM {
+                        row[o * DIM + f] = dotf(w, &patch[f]).max(0.0);
+                    }
                 }
-            }
-        });
+            });
+
+        // conv2 7×7, 32→64，时间步长 5（时补 1、频补 3）→ [t1][64×41]
+        // （频率维第 41 列恒为 0，供 conv3 取窗）
+        let mut y2 = vec![0f32; t1 * F2 * W2];
+        y2.par_chunks_mut(F2 * W2)
+            .enumerate()
+            .for_each(|(ti, row)| {
+                let mut patch = vec![0f32; DIM * K2];
+                for di in 0..7 {
+                    let Some(tt) = at(ti * 5 + di, -1).filter(|&v| v < t) else {
+                        continue;
+                    };
+                    let src = &y1[tt * F1 * DIM..(tt + 1) * F1 * DIM];
+                    for c in 0..F1 {
+                        for f in 0..DIM {
+                            for dj in 0..7 {
+                                let ff = f + dj; // 实际频率 = ff - 3
+                                if (3..DIM + 3).contains(&ff) {
+                                    patch[f * K2 + c * 49 + di * 7 + dj] = src[c * DIM + ff - 3];
+                                }
+                            }
+                        }
+                    }
+                }
+                for o in 0..F2 {
+                    let w = &self.c2[o * K2..(o + 1) * K2];
+                    for f in 0..DIM {
+                        row[o * W2 + f] = dotf(w, &patch[f * K2..(f + 1) * K2]).max(0.0);
+                    }
+                }
+            });
 
         // conv3 3×3, 64→192，频率步长 2（时补 1）→ [t1][192×20]
         let mut y3 = vec![0f32; t1 * FLAT];
@@ -329,7 +353,13 @@ impl Model {
             .map(|row| {
                 row.iter()
                     .enumerate()
-                    .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b })
+                    .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                        if v > b.1 {
+                            (i, v)
+                        } else {
+                            b
+                        }
+                    })
                     .0 as u32
             })
             .collect()
@@ -380,7 +410,9 @@ fn layernorm(x: &[f32], n: &Norm) -> Vec<f32> {
 }
 
 fn add(h: &mut [f32], o: &[f32]) {
-    h.par_iter_mut().zip(o.par_iter()).for_each(|(a, b)| *a += b);
+    h.par_iter_mut()
+        .zip(o.par_iter())
+        .for_each(|(a, b)| *a += b);
 }
 
 /// GELU（tanh 近似）
@@ -459,7 +491,10 @@ mod tests {
     #[test]
     fn gelu_and_norm_basics() {
         assert_eq!(gelu(0.0), 0.0);
-        let n = Norm { g: vec![1.0; D], b: vec![0.0; D] };
+        let n = Norm {
+            g: vec![1.0; D],
+            b: vec![0.0; D],
+        };
         let mut x = vec![0f32; D];
         x[0] = 3.0;
         x[1] = -3.0;
@@ -467,7 +502,10 @@ mod tests {
         let mean: f32 = y.iter().sum::<f32>() / D as f32;
         assert!(mean.abs() < 1e-5);
         // 有 γ/β 时正确应用
-        let n2 = Norm { g: vec![2.0; D], b: vec![1.0; D] };
+        let n2 = Norm {
+            g: vec![2.0; D],
+            b: vec![1.0; D],
+        };
         let y2 = layernorm(&x, &n2);
         for i in 0..D {
             assert!((y2[i] - (2.0 * y[i] + 1.0)).abs() < 1e-4);

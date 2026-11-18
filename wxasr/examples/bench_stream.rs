@@ -28,7 +28,10 @@ fn main() {
             }
         }
         let txt = s.finish();
-        let name = std::path::Path::new(f).file_stem().unwrap().to_string_lossy();
+        let name = std::path::Path::new(f)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy();
         let secs = pcm.len() as f64 / 16000.0;
         println!(
             "{name} audio {secs:.2}s {:.0}ms partials={partials}\t{txt}",

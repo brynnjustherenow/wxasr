@@ -87,8 +87,8 @@ fn parse_chain(d: &[u8], start: usize) -> Option<HashMap<String, Rec>> {
             return None;
         }
         let scales = c.take(ns * 4)?;
-        let scale = (quant != 0 && ns > 0)
-            .then(|| f32::from_le_bytes(scales[..4].try_into().unwrap()));
+        let scale =
+            (quant != 0 && ns > 0).then(|| f32::from_le_bytes(scales[..4].try_into().unwrap()));
         let nz = c.u32()? as usize;
         c.take(nz)?; // 未知名目的附带数据块
         let nd = c.u32()? as usize;
@@ -104,7 +104,16 @@ fn parse_chain(d: &[u8], start: usize) -> Option<HashMap<String, Rec>> {
         }
         let off = c.p;
         c.take(len)?;
-        out.insert(name, Rec { dtype, scale, dims, off, len });
+        out.insert(
+            name,
+            Rec {
+                dtype,
+                scale,
+                dims,
+                off,
+                len,
+            },
+        );
     }
 }
 
@@ -169,7 +178,7 @@ mod tests {
         d.extend_from_slice(b"XNET");
         d.extend_from_slice(&[0u8; 4]);
         d.extend_from_slice(&[1u8; 100]); // 头部填充，不构成合法记录表
-        // 105 条记录（阈值 100 以上），最后一条是量化张量
+                                          // 105 条记录（阈值 100 以上），最后一条是量化张量
         for i in 0..105 {
             let name = format!("layers.{i}.weight");
             let r = if i == 104 {

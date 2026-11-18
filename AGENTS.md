@@ -32,6 +32,9 @@
 
 ## 构建环境(每条 cargo 前必设)
 
+日常开发优先用根目录 `justfile`(`just --list`):`check`/`check-hex`/`test-model`/
+`live`/`live-hex`——hex 相关配方自带下面的四件套环境,不必手动设。
+
 ```powershell
 $env:Path = "C:\Program Files\CMake\bin;$env:Path"
 $env:VULKAN_SDK = "C:\VulkanSDK\1.4.363.0"
@@ -50,7 +53,9 @@ $env:INCLUDE = "C:\VulkanSDK\1.4.363.0\Include;$env:INCLUDE"
 ## 测试
 
 - 依赖真实 GGUF 模型的测试用环境变量 `HEXASR_MODEL` 门控,未设则 skip。
-- 模型文件(用户经 Hex 应用下载,**勿动**):`C:\Users\Administrator\AppData\Local\hex\models\`
+- 模型文件:项目自有副本在 `G:\env\model\asr\`(live_hex 的默认目录,
+  `HEX_MODELS_DIR` 可覆盖);原始文件(用户经 Hex 应用下载,**勿动**)仍在
+  `C:\Users\Administrator\AppData\Local\hex\models\`:
   - `whisper-large-v3-turbo-Q8_0.gguf`(845MB)
   - `Qwen3-ASR-0.6B-Q8_0.gguf`(811MB)
   - `silero-vad-v6.2-F32.gguf`(1.2MB,VAD)

@@ -20,6 +20,9 @@ hex = ["dep:hex-asr"]
 
 [dev-dependencies]
 hound = "3"
+crossterm = "0.29"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+wxasr-provider = { path = "../wxasr-provider" }
 
 # 数值计算在 wxasr 里，让依赖在 debug 测试下也可用
 [profile.dev]
