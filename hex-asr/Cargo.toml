@@ -19,3 +19,6 @@ transcribe-cpp-sys = "=0.4.1"
 
 [dev-dependencies]
 hound = "3"
+# native_probe 诊断用:把 transcribe_cpp::init_logging 接进来的
+# native/ggml 日志放到 stderr(默认无人订阅,原生诊断被吞)
+env_logger = "0.11"

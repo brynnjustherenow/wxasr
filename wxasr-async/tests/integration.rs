@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use wxasr::Model;
-use wxasr_async::{policy::RotatePolicy, start, AsrEvent, Config};
+use wxasr_async::{AsrEvent, Config, policy::RotatePolicy, start};
 
 fn load_model() -> Option<Arc<Model>> {
     let dir = std::env::var("WXASR_MODEL")
@@ -71,12 +71,12 @@ async fn drain(mut rx: tokio::sync::mpsc::Receiver<AsrEvent>) -> Vec<AsrEvent> {
     out
 }
 
-/// 按顺序拼接所有 Final，得到完整转写
+/// 按顺序拼接所有定稿段（Commit 与 End），得到完整转写
 fn transcript(events: &[AsrEvent]) -> String {
     events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Final(t) => Some(t.content.as_str()),
+            AsrEvent::Commit(t) | AsrEvent::End(t) => Some(t.content.as_str()),
             _ => None,
         })
         .collect()
@@ -114,8 +114,8 @@ async fn fast_feed_yields_final() {
 }
 
 /// 三段语音（每段 >5s）间插 1.6s 静音：软上限 3s 意味着第 1、2 段后的
-/// 停顿必然触发静音轮换，各产生一个 Final（第 3 段由 finish 定稿）。
-/// 拼接所有 Final 与三段参考对拍，验证轮换定稿不丢字、拼接无缝。
+/// 停顿必然触发静音轮换，各产生一个 Commit（第 3 段由 finish 定稿成
+/// End）。拼接所有定稿段与三段参考对拍，验证轮换定稿不丢字、拼接无缝。
 #[tokio::test]
 async fn rotation_keeps_transcript_intact() {
     let Some(model) = load_model() else { return };
@@ -152,7 +152,7 @@ async fn rotation_keeps_transcript_intact() {
     let finals: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Final(t) => Some(t.content.as_str()),
+            AsrEvent::Commit(t) | AsrEvent::End(t) => Some(t.content.as_str()),
             _ => None,
         })
         .collect();
@@ -165,7 +165,7 @@ async fn rotation_keeps_transcript_intact() {
     println!("轮换拼接结果: {got}\n参考: {refs}");
     assert!(
         finals.len() >= 3,
-        "两次静音轮换 + 结束定稿应至少产生 3 个 Final: {finals:?}"
+        "两次静音轮换 + 结束定稿应至少产生 3 个定稿段: {finals:?}"
     );
     assert!(
         cer(&refs, &got) < 0.2,
@@ -206,7 +206,7 @@ async fn hard_rotation_mid_speech_stays_accurate() {
         .expect("超时");
     let finals = events
         .iter()
-        .filter(|e| matches!(e, AsrEvent::Final(_)))
+        .filter(|e| matches!(e, AsrEvent::Commit(_) | AsrEvent::End(_)))
         .count();
     let got = transcript(&events);
     println!(
@@ -215,7 +215,7 @@ async fn hard_rotation_mid_speech_stays_accurate() {
     );
     assert!(
         finals >= 4,
-        "18s 音频按 3s 硬切应产生多个 Final，实际 {finals}"
+        "18s 音频按 3s 硬切应产生多个定稿段，实际 {finals}"
     );
     assert!(
         cer(&refs, &got) < 0.1,
@@ -224,9 +224,9 @@ async fn hard_rotation_mid_speech_stays_accurate() {
     );
 }
 
-/// 标点触发轮换：软上限 1s 后遇定稿标点即切。除最后一段（finish 定稿）
-/// 外，每个 Final 都应以标点收尾——行读起来是完整的句/分句；拼接后
-/// 不丢字。
+/// 标点触发轮换：软上限 1s 后遇定稿标点即切。除最后一段（finish 定稿
+/// 成 End）外，每个 Commit 都应以标点收尾——行读起来是完整的句/分句；
+/// 拼接后不丢字。
 #[tokio::test]
 async fn punct_policy_finals_end_with_punctuation() {
     const PUNCT: &[char] = &['，', '。', '？', '！', '、', ',', '.', '?', '!'];
@@ -266,7 +266,7 @@ async fn punct_policy_finals_end_with_punctuation() {
     let finals: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
-            AsrEvent::Final(t) => Some(t.content.as_str()),
+            AsrEvent::Commit(t) | AsrEvent::End(t) => Some(t.content.as_str()),
             _ => None,
         })
         .collect();
@@ -279,7 +279,7 @@ async fn punct_policy_finals_end_with_punctuation() {
 
     assert!(finals.len() >= 3, "应按标点切出多段: {finals:?}");
     for f in &finals[..finals.len() - 1] {
-        assert!(f.ends_with(PUNCT), "标点触发的 Final 应以标点收尾: {f:?}");
+        assert!(f.ends_with(PUNCT), "标点触发的 Commit 应以标点收尾: {f:?}");
     }
     assert!(
         cer(&refs, &got) < 0.15,
@@ -322,7 +322,7 @@ async fn realtime_feed_produces_partials() {
         partials.len(),
         partials.first().copied().unwrap_or("")
     );
-    println!("Final: {final_text}");
+    println!("完整转写: {final_text}");
     assert!(!partials.is_empty(), "实时节奏下应有中间结果");
     assert!(cer(&text, &final_text) < 0.1);
 }
@@ -351,11 +351,12 @@ async fn two_streams_share_one_model() {
             }
             handle.finish();
         });
-        // 拼接所有 Final，直到通道关闭
+        // 拼接所有定稿段，直到通道关闭
         let mut text = String::new();
         while let Some(ev) = rx.recv().await {
-            if let AsrEvent::Final(t) = ev {
-                text += &t.content;
+            match ev {
+                AsrEvent::Commit(t) | AsrEvent::End(t) => text += &t.content,
+                AsrEvent::Partial(_) => {}
             }
         }
         feeder.await.unwrap();

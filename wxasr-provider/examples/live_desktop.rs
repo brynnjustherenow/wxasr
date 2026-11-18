@@ -3,7 +3,7 @@
 //! `cargo run --release --example live_desktop -- [模型目录]`
 //!
 //! - 中间结果（Partial）：💬 当前行实时刷新
-//! - 定稿（Final）：✅ 换行提交，之前行不再变化（上下文轮换或结束时各一次）
+//! - 定稿（Commit/End）：✅ 换行提交，之前行不再变化（上下文轮换或结束时各一次）
 //! - Ctrl+C：优雅结束——定稿当前段（✅）后退出，各行落回主屏幕；
 //!   再按一次 Ctrl+C 立即强制退出
 //!
@@ -38,7 +38,7 @@ async fn main() {
     let mut out = io::stdout();
     let _ = execute!(out, EnterAlternateScreen, Hide);
 
-    let mut committed: Vec<String> = Vec::new(); // Final 定稿各行
+    let mut committed: Vec<String> = Vec::new(); // 定稿各行（Commit/End）
     let mut live = String::new(); // 当前段中间结果
     let mut finishing = false;
     loop {
@@ -46,7 +46,7 @@ async fn main() {
         tokio::select! {
             ev = rx.recv() => match ev {
                 Some(AsrEvent::Partial(t)) => live = t.content,
-                Some(AsrEvent::Final(t)) => {
+                Some(AsrEvent::Commit(t)) | Some(AsrEvent::End(t)) => {
                     committed.push(t.content);
                     live.clear();
                 }

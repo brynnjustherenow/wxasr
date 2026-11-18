@@ -43,17 +43,23 @@ fn shared_engine() -> Option<Arc<Engine>> {
     ENGINE
         .get_or_init(|| {
             let path = model_path()?;
-            // A model that does not advertise auto-detection needs an
-            // explicit hint (HEXASR_LANG), folded into the shared spec.
-            let spec = match std::env::var("HEXASR_LANG")
-                .ok()
-                .filter(|lang| !lang.is_empty())
-            {
-                Some(lang) => ModelSpec {
-                    language: Some(lang),
-                    ..ModelSpec::new(&path)
-                },
-                None => ModelSpec::new(&path),
+            // A parakeet model never advertises auto-detection and needs its
+            // en hint plus the 400 ms trailing silence that keeps its closing
+            // punctuation (`ModelSpec::unified_english`); other models take
+            // the HEXASR_LANG hint or auto-detect.
+            let spec = if path.to_ascii_lowercase().contains("parakeet") {
+                ModelSpec::unified_english(&path)
+            } else {
+                match std::env::var("HEXASR_LANG")
+                    .ok()
+                    .filter(|lang| !lang.is_empty())
+                {
+                    Some(lang) => ModelSpec {
+                        language: Some(lang),
+                        ..ModelSpec::new(&path)
+                    },
+                    None => ModelSpec::new(&path),
+                }
             };
             let device = device_choice();
             let started = Instant::now();
@@ -91,6 +97,31 @@ impl SessionEvents for Collector {
     fn emit(&mut self, event: SessionEvent) -> bool {
         self.events.push(event);
         true
+    }
+}
+
+/// `gguf_meta` reads only the file header (no weights): the model's own
+/// claims about streaming. parakeet advertises `stt.capability.streaming`
+/// (its C++ family default never sets it — the KV is the only source);
+/// whisper/qwen have no such KV. This test never touches the engine, so
+/// it is fast even with `HEXASR_MODEL` set.
+#[test]
+fn gguf_meta_reads_the_models_own_header() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let meta = hex_asr::gguf_meta(&path)
+        .unwrap_or_else(|error| panic!("could not read the header of {path}: {error:#}"));
+    println!(
+        "arch={} streaming={} name={:?}",
+        meta.architecture, meta.streaming, meta.name
+    );
+    assert!(!meta.architecture.is_empty());
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("parakeet") {
+        assert!(meta.streaming, "parakeet advertises streaming");
+    } else if lower.contains("whisper") || lower.contains("qwen") {
+        assert!(!meta.streaming, "whisper/qwen have no streaming KV");
     }
 }
 

@@ -139,7 +139,7 @@ async fn main() {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(ev)) => match ev {
                 AsrEvent::Partial(p) => println!("… {}", p.content),
-                AsrEvent::Final(f) => {
+                AsrEvent::Commit(f) | AsrEvent::End(f) => {
                     println!("段: {}", f.content);
                     lines.push(f.content);
                 }

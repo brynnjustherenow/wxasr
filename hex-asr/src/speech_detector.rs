@@ -159,9 +159,13 @@ pub fn prewarm() {
 #[cfg_attr(test, allow(dead_code))]
 fn loaded_session(state: &mut State) -> Option<&mut VadSession> {
     if matches!(state, State::Unloaded) {
-        *state = match lock_model().as_deref().and_then(|path| load(path).ok()) {
+        // 锁一次、复用绑定:scrutinee 里的临时守卫活到 match 结束,第二支
+        // 再调 lock_model() 会同线程重锁死锁(MODEL 为 None 时必进该支,
+        // 2026-11-19 定案的 whisper "死等" 即此处)。
+        let model = lock_model();
+        *state = match model.as_deref().and_then(|path| load(path).ok()) {
             Some(session) => State::Loaded(session),
-            None if lock_model().is_none() => State::Unloaded,
+            None if model.is_none() => State::Unloaded,
             None => {
                 tracing::warn!("could not load the speech detector");
                 State::Failed

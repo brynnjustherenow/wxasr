@@ -47,6 +47,7 @@
 
 pub mod audio;
 pub mod engine;
+pub mod gguf_meta;
 pub mod gguf_session;
 pub mod gpu_health;
 pub mod local_transcriber;
@@ -55,14 +56,17 @@ pub mod session;
 pub mod speech_detector;
 pub mod subtitle_credits;
 pub mod transcript;
+pub mod vad;
 
 pub use audio::{Resampler, SAMPLE_RATE};
 pub use engine::{
     Engine, LiveStream, Offline, Partial, PendingTranscript, Source, Transcribed, YieldingStream,
 };
+pub use gguf_meta::{GgufMeta, gguf_meta};
 pub use local_transcriber::{Device, LocalTranscriber, ModelSpec};
 pub use session::{SessionEvent, SessionEvents, StreamingSession};
 pub use transcript::{TimestampLevel, Transcript, TranscriptSegment};
+pub use vad::SileroVad;
 
 /// Silence after a Unified English clip (400 ms at 16 kHz), so the model
 /// has the context to emit the final word and its closing punctuation

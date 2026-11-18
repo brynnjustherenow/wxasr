@@ -7,20 +7,24 @@
 //! 全部由后端自持,不进 async 执行器。
 //!
 //! wxasr 是第一个后端([`backend_wxasr::WxasrBackend`]):VAD、partial
-//! 节流与 [`policy`] 轮换都住在那里,经 [`start`] 开箱即用;其他后端
-//! (如未来的 hex-asr)实现 [`AsrBackend`]/[`AsrSession`] 后经
-//! [`start_with`] 接入,与 wxasr 共享同一套线程/通道桥与事件流
-//! (轮换与 VAD 的语义见 [`backend_wxasr`] 模块文档)。
+//! 节流与 [`policy`] 轮换都住在那里,经 [`start`] 开箱即用;hex-asr
+//! 后端([`backend_hex::HexBackend`],`hex` feature)实现同一契约,自带
+//! 轮换(native 流一次性,轮换 = 老流 finish + 新流)与 Silero VAD
+//! endpointing。各后端经 [`start_with`] 接入,共享同一套线程/通道桥与
+//! 事件流(会话语义见各后端模块文档)。
 //!
 //! # 事件流
 //!
-//! - [`AsrEvent::Partial`][]:当前段(上次定稿之后)的中间结果。wxasr
-//!   后端已按计算成本自动节流(新增 ≥ `partial_min_fresh` 帧,且距
-//!   上次 ≥ 3× 上次计算耗时,慢机自动降频)
-//! - [`AsrEvent::Final`][]:一段定稿。wxasr 后端每次上下文轮换产生一个;
-//!   [`AsrHandle::finish`] 或所有句柄 drop 时再为最后一段产生一个
-//!   (空文本不发)。之后的 `Partial` 从空开始
-//! - 通道关闭(`recv` 返回 `None`)表示会话结束
+//! 事件序:`(Partial* Commit)* Partial* End?` → 通道关闭。
+//!
+//! - [`AsrEvent::Partial`][]:当前段的中间结果(tentative 可回改,
+//!   显示用)。wxasr 后端已按计算成本自动节流(新增 ≥
+//!   `partial_min_fresh` 帧,且距上次 ≥ 3× 上次计算耗时,慢机自动降频)
+//! - [`AsrEvent::Commit`][]:一段已定稿——稳定前缀提交 + 切断,由上下文
+//!   轮换产生,会话继续(空文本不发)。之后的 `Partial` 从空开始
+//! - [`AsrEvent::End`][]:会话结束([`AsrHandle::finish`] 或所有句柄
+//!   drop)补定的最后一段(空文本不发);最多一个。会话结束仍以
+//!   **通道关闭**(`recv` 返回 `None`)为准,`End` 不是关闭事件
 //!
 //! 事件载荷是 [`AsrText`]:除 `content` 外的字段按模型能力填充,
 //! 不支持为 `None`/空(wxasr 后端只填 `content`)。
@@ -32,7 +36,7 @@
 //! 降混与重采样在各后端内部完成,调用方无感。16 kHz 单声道
 //! ([`AudioIn::MONO_16K`])零转换直通。
 //!
-//! 完整转写 = 按顺序拼接所有 `Final`。
+//! 完整转写 = 按顺序拼接所有 `Commit` 与 `End`。
 //!
 //! # 入门
 //!
@@ -47,7 +51,8 @@
 //! while let Some(ev) = rx.recv().await {
 //!     match ev {
 //!         AsrEvent::Partial(t) => { /* 当前段边说边显 */ }
-//!         AsrEvent::Final(t) => println!("{}", t.content), // 一段定稿
+//!         AsrEvent::Commit(t) => println!("{}", t.content), // 一段定稿,会话继续
+//!         AsrEvent::End(t) => println!("{}", t.content),    // 最后一段,随后通道关闭
 //!     }
 //! }
 //! // 通道关闭:会话结束
@@ -84,11 +89,12 @@ pub struct AsrSegment {
     pub speaker: Option<u32>,
 }
 
-/// 一次识别结果,[`AsrEvent::Partial`] 与 [`AsrEvent::Final`] 共用。
+/// 一次识别结果,[`AsrEvent::Partial`] 与 [`AsrEvent::Commit`]/
+/// [`AsrEvent::End`] 共用。
 ///
 /// 除 `content` 外的字段按模型能力填充:模型(或后端)不支持时为
 /// `None`/空——wxasr 后端只填 `content`。`Partial` 通常也只有
-/// `content`(中间结果是文本增量);语言/时间戳在 `Final` 到齐
+/// `content`(中间结果是文本增量);语言/时间戳在 `Commit`/`End` 到齐
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AsrText {
     /// 识别文本,唯一必填字段
@@ -113,15 +119,20 @@ impl AsrText {
     }
 }
 
-/// 识别事件(按时间顺序产生)
+/// 识别事件(按时间顺序产生):`(Partial* Commit)* Partial* End?` →
+/// 通道关闭
 #[derive(Debug, Clone)]
 pub enum AsrEvent {
-    /// 当前段的中间结果(已节流,仅当开启 `Config::partial`);
-    /// 每次 [`Final`](Self::Final) 之后从空开始
+    /// 当前段的中间结果(已节流,仅当开启 `Config::partial`);tentative
+    /// 可回改,只做显示。每次 [`Commit`](Self::Commit)/[`End`](Self::End)
+    /// 之后从空开始
     Partial(AsrText),
-    /// 一段定稿:上下文轮换时、以及结束时的最后一段各产生一个(空文本
-    /// 不发)。不是关闭事件——会话结束以通道关闭为准
-    Final(AsrText),
+    /// 一段已定稿:稳定前缀提交 + 切断,由上下文轮换产生,**会话继续**
+    /// (空文本不发)
+    Commit(AsrText),
+    /// 会话结束(`finish`/句柄全 drop)补定的最后一段(空文本不发,
+    /// 最多一个)。不是关闭事件——会话结束以通道关闭为准
+    End(AsrText),
 }
 
 /// 调用方音频的格式:会话创建时声明一次,之后所有
@@ -226,7 +237,7 @@ impl AsrHandle {
         let _ = self.tx.send(AudioMsg::Pcm(pcm.to_vec()));
     }
 
-    /// 结束识别:识别线程定稿最后一段并发送 [`AsrEvent::Final`],
+    /// 结束识别:识别线程定稿最后一段并发送 [`AsrEvent::End`],
     /// 随后关闭事件通道。消耗 self;所有句柄 drop 时同样触发结束。
     pub fn finish(self) {
         let _ = self.tx.send(AudioMsg::End);
@@ -358,7 +369,7 @@ mod tests {
         }
 
         fn finish(&mut self, out: &mut dyn AsrEvents) {
-            out.emit(AsrEvent::Final(AsrText::plain(format!("{}ms", self.ms))));
+            out.emit(AsrEvent::End(AsrText::plain(format!("{}ms", self.ms))));
         }
     }
 
@@ -375,8 +386,8 @@ mod tests {
         );
         let ev = rx.blocking_recv();
         assert!(
-            matches!(ev, Some(AsrEvent::Final(ref t)) if t.content == "100ms"),
-            "应为 Final,实际 {ev:?}"
+            matches!(ev, Some(AsrEvent::End(ref t)) if t.content == "100ms"),
+            "应为 End,实际 {ev:?}"
         );
         assert!(rx.blocking_recv().is_none()); // 通道关闭 = 会话结束
     }
@@ -389,8 +400,8 @@ mod tests {
         drop(handle);
         let ev = rx.blocking_recv();
         assert!(
-            matches!(ev, Some(AsrEvent::Final(ref t)) if t.content == "20ms"),
-            "应为 Final,实际 {ev:?}"
+            matches!(ev, Some(AsrEvent::End(ref t)) if t.content == "20ms"),
+            "应为 End,实际 {ev:?}"
         );
         assert!(rx.blocking_recv().is_none());
     }
@@ -422,7 +433,7 @@ mod tests {
 
         fn finish(&mut self, out: &mut dyn AsrEvents) {
             self.record("finish");
-            let _ = out.emit(AsrEvent::Final(AsrText::plain("final")));
+            let _ = out.emit(AsrEvent::End(AsrText::plain("end")));
         }
     }
 

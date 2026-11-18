@@ -1,7 +1,7 @@
 [package]
 name = "wxasr-async"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "流式 ASR 统一异步层：专用识别线程 + tokio mpsc 事件桥；wxasr 为首个后端（上下文轮换定稿、中间结果节流）"
 license = "MIT"
 
@@ -11,12 +11,14 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 uuid = { version = "1", features = ["v7"] }
 eyre = "0.6.14"
 rubato = "5.0.1"
+# backend_hex 的 VAD 降级告警;仅 hex feature 使用
+tracing = { version = "0.1", optional = true }
 hex-asr = { path = "../hex-asr", optional = true }
 
 [features]
 # hex-asr 后端(transcribe-cpp GGUF 推理栈):默认不开,启用需要
 # CMake + Vulkan SDK 的构建环境(见 hex-asr 的文档)
-hex = ["dep:hex-asr"]
+hex = ["dep:hex-asr", "dep:tracing"]
 
 [dev-dependencies]
 hound = "3"

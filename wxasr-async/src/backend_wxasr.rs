@@ -10,13 +10,14 @@
 //! [`wxasr::Stream`] 的内部状态(特征帧缓冲约 16KB/s、已定稿 token)
 //! 随会话时长线性增长,长会话会持续挤压内存并拖慢中间结果。会话按
 //! [`RotatePolicy`](crate::policy::RotatePolicy) 在合适的时机定稿当前流、发出
-//! [`Final`](crate::AsrEvent::Final) 并接续(新流携带切点前 1s 左文与切点后
-//! 未定稿尾部,切点取在字间停顿处——说话中硬切也不丢字)。会话不保留
+//! [`Commit`](crate::AsrEvent::Commit) 并接续(新流携带切点前 1s 左文与切点后
+//! 未定稿尾部,切点取在字间停顿处——说话中硬切也不丢字);会话结束时
+//! 最后一段以 [`End`](crate::AsrEvent::End) 定稿。会话不保留
 //! 已定稿文本,资源占用与会话总长无关。
 //!
 //! 默认策略为 [`Punct`](crate::policy::RotatePolicy::Punct)
 //! `{ soft_ms: 10s, hard_ms: 20s }`:累计 10s 后遇定稿标点即轮换,
-//! `Final` 以标点收尾;累计 20s 即使无标点(音乐/噪声/连续说话)也强制
+//! `Commit` 以标点收尾;累计 20s 即使无标点(音乐/噪声/连续说话)也强制
 //! 轮换。[`Auto`](crate::policy::RotatePolicy::Auto) 改为静音触发:软上限后于
 //! 下一次 ≥500ms 静音处轮换。注意硬上限可能在说话中触发,定稿解码
 //! (约半秒)期间会话暂停消费音频(通道不丢数据,只是中间结果晚到)。
@@ -151,7 +152,7 @@ impl AsrSession for WxasrStream {
                 if !text.is_empty() {
                     // 消费端已关闭(返回 false)也到此为止——这已是 push 的
                     // 最后一步;旧版 worker 此处 return,效果相同
-                    let _ = out.emit(AsrEvent::Final(AsrText::plain(text)));
+                    let _ = out.emit(AsrEvent::Commit(AsrText::plain(text)));
                 }
             }
         }
@@ -170,20 +171,22 @@ impl AsrSession for WxasrStream {
         };
         let text = stream.finish();
         if !text.is_empty() {
-            let _ = out.emit(AsrEvent::Final(AsrText::plain(text))); // 消费端已关闭也忽略
+            let _ = out.emit(AsrEvent::End(AsrText::plain(text))); // 消费端已关闭也忽略
         }
     }
 }
 
-/// 轻量自适应 VAD。
+/// 轻量自适应 VAD(能量门)。
 ///
 /// 判定用 25ms 子块的 RMS 峰值:语音有音节起伏(峰值高),平稳底噪
 /// 无论多响峰值都接近均值,因此比整块均值更能区分「软语音 vs 响底噪」。
 /// 语音判定:峰值 > 噪声底×2.5 + 150(i16 幅度尺度)。
 /// 噪声底只在静音段更新,且非对称:快速下跟、极慢上漂——防止被
 /// 误判的软语音棘轮式抬高阈值。
+///
+/// wxasr 后端直接使用;hex 后端在 Silero VAD 缺失或失败时降级用它。
 #[derive(Default)]
-struct Vad {
+pub(crate) struct Vad {
     noise: Option<f32>,
 }
 
@@ -195,7 +198,7 @@ impl Vad {
         (pcm.iter().map(|&v| v as f32 * v as f32).sum::<f32>() / pcm.len() as f32).sqrt()
     }
 
-    fn is_speech(&mut self, pcm: &[i16]) -> bool {
+    pub(crate) fn is_speech(&mut self, pcm: &[i16]) -> bool {
         // 25ms 子块 RMS 峰值
         let peak = pcm.chunks(400).map(Self::rms).fold(0.0f32, f32::max);
         let avg = Self::rms(pcm);

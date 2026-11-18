@@ -27,9 +27,12 @@
 //! }
 //! ```
 //!
-//! `Config::rotate` / `Config::partial_min_fresh` are wxasr session
-//! semantics ("其他后端按自身语义处理或忽略"); this backend ignores them
-//! and takes only `partial`.
+//! `Config::partial_min_fresh` is wxasr-only (hex streams throttle
+//! themselves); `Config::rotate` the hex backend implements *on top of* this
+//! session: the native stream is one-shot (no split-off or incremental
+//! finalize API), so a rotation is a `finish` (which drains the decode lag
+//! into this segment) followed by a fresh `open` — this session itself never
+//! rotates.
 
 use std::sync::Arc;
 
@@ -71,6 +74,11 @@ pub struct StreamingSession {
     clip: Vec<f32>,
     /// i16 → f32 conversion scratch.
     converted: Vec<f32>,
+    /// The latest partial's committed prefix, which only grows within one
+    /// stream. A rotation policy reads it through
+    /// [`committed_text`](Self::committed_text) to spot new sentence-end
+    /// punctuation.
+    committed: String,
     /// Whether pushes report partials at all.
     partials: bool,
     /// The consumer closed; stop computing.
@@ -83,11 +91,17 @@ impl StreamingSession {
     /// docs); the engine thread itself must already be running.
     pub fn open(engine: Arc<Engine>, partials: bool) -> Self {
         let stream = engine.begin();
+        if partials && stream.is_none() {
+            tracing::info!(
+                "this model cannot stream on its device; the session only accumulates, so no partial text"
+            );
+        }
         Self {
             engine,
             stream,
             clip: Vec::new(),
             converted: Vec::new(),
+            committed: String::new(),
             partials,
             dead: false,
         }
@@ -112,6 +126,7 @@ impl StreamingSession {
             && let Some(partial) = stream.take_partial()
         {
             let text = partial_text(&partial);
+            self.committed = partial.stable;
             if !text.is_empty() && !out.emit(SessionEvent::Partial(text)) {
                 self.close();
             }
@@ -161,6 +176,14 @@ impl StreamingSession {
     /// Samples pushed so far, as the finish will carry them.
     pub fn pushed_samples(&self) -> usize {
         self.clip.len()
+    }
+
+    /// The stream's committed text so far: the stable prefix of its latest
+    /// partial, which only grows within one stream. Empty for an offline
+    /// session (nothing streams) and until the first partial arrives. A
+    /// rotation policy scans its growth for sentence-end punctuation.
+    pub fn committed_text(&self) -> &str {
+        &self.committed
     }
 
     /// Whether this session streams on its device (an offline session only
