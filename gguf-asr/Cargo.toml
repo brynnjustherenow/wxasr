@@ -1,8 +1,8 @@
 [package]
-name = "hex-asr"
+name = "gguf-asr"
 version = "0.1.0"
 edition = "2024"
-description = "Standalone GGUF speech-to-text inference stack extracted from Hex (engine thread, streaming, offline fallback)"
+description = "Standalone GGUF speech-to-text inference stack inspired by Hex, reimplemented and extended (engine thread, streaming, diarization, offline fallback)"
 license = "MIT"
 
 [dependencies]

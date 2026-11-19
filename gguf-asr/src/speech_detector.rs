@@ -148,7 +148,7 @@ pub fn prewarm() {
     #[cfg(not(test))]
     if lock_model().is_some() {
         let _ = std::thread::Builder::new()
-            .name("hexasr-speech-detector".into())
+            .name("ggufasr-speech-detector".into())
             .spawn(|| {
                 let _ = loaded_session(&mut lock_state());
             });
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn a_corrupt_detector_file_is_not_loaded() {
         let path = std::env::temp_dir().join(format!(
-            "hexasr-corrupt-speech-detector-{}.gguf",
+            "ggufasr-corrupt-speech-detector-{}.gguf",
             std::process::id()
         ));
         std::fs::write(&path, b"not a gguf file").unwrap();

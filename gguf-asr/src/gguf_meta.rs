@@ -264,7 +264,7 @@ mod tests {
     /// 写临时文件再解析(与真实用法同路径:File + BufReader + Seek)
     fn parse_fixture(bytes: &[u8]) -> Result<GgufMeta> {
         let path = std::env::temp_dir().join(format!(
-            "hex-asr-gguf-meta-{}-{:x}.gguf",
+            "gguf-asr-gguf-meta-{}-{:x}.gguf",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

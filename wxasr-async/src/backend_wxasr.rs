@@ -184,7 +184,7 @@ impl AsrSession for WxasrStream {
 /// 噪声底只在静音段更新,且非对称:快速下跟、极慢上漂——防止被
 /// 误判的软语音棘轮式抬高阈值。
 ///
-/// wxasr 后端直接使用;hex 后端在 Silero VAD 缺失或失败时降级用它。
+/// wxasr 后端直接使用;gguf 后端在 Silero VAD 缺失或失败时降级用它。
 #[derive(Default)]
 pub(crate) struct Vad {
     noise: Option<f32>,

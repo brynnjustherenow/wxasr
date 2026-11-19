@@ -444,7 +444,7 @@ pub fn timestamp_level(kind: transcribe_cpp::TimestampKind) -> TimestampLevel {
 }
 
 /// 100 ms at 16 kHz: the span a long clip is cut through.
-const QUIET_SPAN_SAMPLES: usize = 1_600;
+pub(crate) const QUIET_SPAN_SAMPLES: usize = 1_600;
 /// How far back from a window's end the quietest span is looked for.
 const QUIET_SEARCH_SAMPLES: usize = 5 * 16_000;
 
@@ -490,7 +490,7 @@ pub fn chunk_ranges(samples: &[f32], max_samples: usize) -> Vec<Range<usize>> {
 }
 
 /// The midpoint of the quietest `span` samples, the latest one on a tie.
-fn quietest_span(samples: &[f32], span: usize) -> usize {
+pub(crate) fn quietest_span(samples: &[f32], span: usize) -> usize {
     if samples.is_empty() {
         return 0;
     }

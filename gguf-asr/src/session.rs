@@ -19,16 +19,16 @@
 //! A wxasr-async backend is then a thin adapter on *its* side:
 //!
 //! ```text
-//! struct HexBackend { engine: Arc<hex_asr::Engine> }   // AsrBackend
+//! struct GgufBackend { engine: Arc<gguf_asr::Engine> }   // AsrBackend
 //! fn open(&self, cfg) -> Result<Box<dyn AsrSession>> {
-//!     Ok(Box::new(hex_asr::StreamingSession::open(
+//!     Ok(Box::new(gguf_asr::StreamingSession::open(
 //!         self.engine.clone(), cfg.partial,
 //!     )))  // + a 4-line AsrEvents → SessionEvents adapter
 //! }
 //! ```
 //!
-//! `Config::partial_min_fresh` is wxasr-only (hex streams throttle
-//! themselves); `Config::rotate` the hex backend implements *on top of* this
+//! `Config::partial_min_fresh` is wxasr-only (gguf streams throttle
+//! themselves); `Config::rotate` the gguf backend implements *on top of* this
 //! session: the native stream is one-shot (no split-off or incremental
 //! finalize API), so a rotation is a `finish` (which drains the decode lag
 //! into this segment) followed by a fresh `open` — this session itself never
@@ -165,9 +165,13 @@ impl StreamingSession {
         }
     }
 
-    /// Cancels the stream and stops computing, as a closed consumer asks.
-    /// Dropping the [`LiveStream`] cancels it on the engine.
-    fn close(&mut self) {
+    /// Cancels the stream and stops computing, without finalizing: the
+    /// engine sees only a cancel, so no drain and no offline fallback runs.
+    /// A caller that keeps its own copy of the audio (a diarize commit
+    /// retranscribes the segment authoritatively) ends a rotation this way;
+    /// a closed consumer asks for the same thing. After this, pushes and a
+    /// `finish` do nothing.
+    pub fn close(&mut self) {
         self.dead = true;
         self.stream = None;
         self.clip.clear();

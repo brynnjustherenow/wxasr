@@ -1,27 +1,27 @@
-//! hex 后端集成测试:需要 `--features hex` 编译、`HEXASR_MODEL` 指向
+//! gguf 后端集成测试:需要 `--features gguf` 编译、`GGUFASR_MODEL` 指向
 //! 真实 GGUF 模型(未设则全部静默跳过),例如:
 //!
 //! ```text
-//! HEXASR_MODEL=path/to/model.gguf cargo test -p wxasr-async --features hex --test hex_backend
+//! GGUFASR_MODEL=path/to/model.gguf cargo test -p wxasr-async --features gguf --test gguf_backend
 //! ```
-#![cfg(feature = "hex")]
+#![cfg(feature = "gguf")]
 
 use std::sync::{Arc, OnceLock};
 
-use wxasr_async::backend_hex::HexBackend;
+use wxasr_async::backend_gguf::{DiarizeOptions, GgufBackend, HasDiarize, PseudoOptions};
 use wxasr_async::{AsrEvent, AsrText, AudioIn, Config, start_with};
 
 fn model_path() -> Option<String> {
-    std::env::var("HEXASR_MODEL")
+    std::env::var("GGUFASR_MODEL")
         .ok()
         .filter(|path| !path.is_empty())
 }
 
-fn device() -> hex_asr::Device {
-    match std::env::var("HEXASR_DEVICE").ok().as_deref() {
-        Some("gpu") => hex_asr::Device::Gpu,
-        Some("cpu") => hex_asr::Device::Cpu,
-        _ => hex_asr::Device::Auto,
+fn device() -> gguf_asr::Device {
+    match std::env::var("GGUFASR_DEVICE").ok().as_deref() {
+        Some("gpu") => gguf_asr::Device::Gpu,
+        Some("cpu") => gguf_asr::Device::Cpu,
+        _ => gguf_asr::Device::Auto,
     }
 }
 
@@ -57,42 +57,42 @@ fn up_to_44k1_stereo(pcm: &[i16]) -> Vec<i16> {
 }
 
 /// 引擎只加载一次(模型常驻),所有会话共享。
-fn engine(path: &str) -> Arc<hex_asr::Engine> {
-    static ENGINE: OnceLock<Option<Arc<hex_asr::Engine>>> = OnceLock::new();
+fn engine(path: &str) -> Arc<gguf_asr::Engine> {
+    static ENGINE: OnceLock<Option<Arc<gguf_asr::Engine>>> = OnceLock::new();
     ENGINE
         .get_or_init(|| {
             Some(Arc::new(
-                hex_asr::Engine::load(&spec_for(path), device())
+                gguf_asr::Engine::load(&spec_for(path), device())
                     .unwrap_or_else(|error| panic!("加载 {path} 失败: {error:#}")),
             ))
         })
         .clone()
-        .expect("HEXASR_MODEL 已设置,引擎应加载成功")
+        .expect("GGUFASR_MODEL 已设置,引擎应加载成功")
 }
 
 /// parakeet 家族需要 en 提示 + 400ms trailing silence(它不自报语言检测、
 /// 句末标点依赖尾静音,即 `ModelSpec::unified_english`);其他模型按
-/// `HEXASR_LANG` 提示或自动检测
-fn spec_for(path: &str) -> hex_asr::ModelSpec {
+/// `GGUFASR_LANG` 提示或自动检测
+fn spec_for(path: &str) -> gguf_asr::ModelSpec {
     if path.to_ascii_lowercase().contains("parakeet") {
-        return hex_asr::ModelSpec::unified_english(path);
+        return gguf_asr::ModelSpec::unified_english(path);
     }
-    match std::env::var("HEXASR_LANG")
+    match std::env::var("GGUFASR_LANG")
         .ok()
         .filter(|lang| !lang.is_empty())
     {
-        Some(lang) => hex_asr::ModelSpec {
+        Some(lang) => gguf_asr::ModelSpec {
             language: Some(lang),
-            ..hex_asr::ModelSpec::new(path)
+            ..gguf_asr::ModelSpec::new(path)
         },
-        None => hex_asr::ModelSpec::new(path),
+        None => gguf_asr::ModelSpec::new(path),
     }
 }
 
 /// 用声明的格式跑一次会话,返回唯一的 End。
 fn recognize(path: &str, audio: AudioIn, samples: &[i16]) -> AsrText {
     let (handle, mut rx) = start_with(
-        Box::new(HexBackend::new(engine(path))),
+        Box::new(GgufBackend::new(engine(path))),
         Config::default(),
         audio,
     );
@@ -104,14 +104,14 @@ fn recognize(path: &str, audio: AudioIn, samples: &[i16]) -> AsrText {
             finals.push(text);
         }
     }
-    assert_eq!(finals.len(), 1, "hex 会话恰一个 End: {finals:?}");
+    assert_eq!(finals.len(), 1, "gguf 会话恰一个 End: {finals:?}");
     finals.pop().unwrap()
 }
 
 /// 同一模型、同一音频:16 kHz 单声道直通 vs 44.1 kHz 立体声(经后端
 /// 内部降混/重采样),识别结果应一致——证明统一层的格式声明契约。
 #[test]
-fn hex_backend_recognizes_any_declared_format() {
+fn gguf_backend_recognizes_any_declared_format() {
     let Some(path) = model_path() else {
         return;
     };
@@ -142,11 +142,41 @@ fn hex_backend_recognizes_any_declared_format() {
     assert_eq!(direct.language, converted.language);
 }
 
-/// SAPI 英语 wav(轮换测试的输入;`HEXASR_WAV` 可覆盖,默认用仓库合成
+/// builder 链:typestate 上 `with_speaker_split` 只在 `with_diarize`
+/// 之后可达(顺序错在别处就是编译错误),链尾即成品、会话照常开;存量
+/// 组合构造器同批保留(返回 `HasDiarize`,可继续链)。
+#[test]
+fn builder_chains_capabilities_into_a_working_backend() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let pcm = wav_16k_mono();
+    let backend = GgufBackend::new(engine(&path))
+        .with_pseudo_streaming(PseudoOptions::default())
+        .with_diarize(DiarizeOptions { window_ms: 0 })
+        .with_speaker_split(gguf_asr::SpeakerSplit::Off);
+    let (handle, mut rx) = start_with(Box::new(backend), Config::default(), AudioIn::MONO_16K);
+    handle.push(&pcm);
+    handle.finish();
+    let mut ends = 0;
+    while let Some(event) = rx.blocking_recv() {
+        if matches!(event, AsrEvent::End(_)) {
+            ends += 1;
+        }
+    }
+    assert_eq!(ends, 1, "builder 链尾的后端照常出唯一 End");
+    let _legacy: GgufBackend<HasDiarize> = GgufBackend::with_pseudo_and_diarize(
+        engine(&path),
+        PseudoOptions::default(),
+        DiarizeOptions::default(),
+    );
+}
+
+/// SAPI 英语 wav(轮换测试的输入;`GGUFASR_WAV` 可覆盖,默认用仓库合成
 /// 副本 `tests/data/sapi_en.wav`,16 kHz 单声道 i16,合成方法见
 /// AGENTS.md)。同名 `.txt` 是参考转写。
 fn sapi_wav() -> Option<String> {
-    match std::env::var("HEXASR_WAV") {
+    match std::env::var("GGUFASR_WAV") {
         Ok(path) if !path.is_empty() => Some(path),
         _ => {
             let default = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/sapi_en.wav");
@@ -192,7 +222,7 @@ fn cer(reference: &[char], hypothesis: &[char]) -> f64 {
 /// `Commit` + 恰一个 `End` + 按序拼接 = 完整转写。只对流式模型
 /// (parakeet)有意义——非流式模型 committed 不增长,只剩硬上限轮换。
 #[test]
-fn hex_rotation_commits_segments_and_ends_once() {
+fn gguf_rotation_commits_segments_and_ends_once() {
     let Some(path) = model_path() else { return };
     let Some(wav) = sapi_wav() else { return };
     let reference = std::path::Path::new(&wav)
@@ -217,7 +247,7 @@ fn hex_rotation_commits_segments_and_ends_once() {
     let pcm: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
 
     let (handle, mut rx) = start_with(
-        Box::new(HexBackend::new(engine)),
+        Box::new(GgufBackend::new(engine)),
         Config::default(), // Punct{10s,20s} + partial
         AudioIn::MONO_16K,
     );
@@ -321,14 +351,14 @@ fn read_wav_16k_mono(path: &str) -> Vec<i16> {
 /// 后端补全完整事件行为——💬 整段重转写(可回改)、✅ 段权威定稿、
 /// 🏁 恰一个 End,拼接 = 完整转写。需要 GPU(CPU+whisper 超引擎
 /// deadline 属设计内快速失败,这里 skip);输入 SAPI 英语 wav(36s,
-/// 参考转写 `.txt`)。`HEXASR_MODEL` 非 whisper 则 skip。
+/// 参考转写 `.txt`)。`GGUFASR_MODEL` 非 whisper 则 skip。
 #[test]
 fn pseudo_streaming_whisper_emits_full_events() {
     let Some(path) = model_path() else { return };
     if !path.to_ascii_lowercase().contains("whisper") {
         return;
     }
-    if std::env::var("HEXASR_DEVICE").as_deref() == Ok("cpu") {
+    if std::env::var("GGUFASR_DEVICE").as_deref() == Ok("cpu") {
         eprintln!("[skip] CPU+whisper 超引擎 deadline(设计内),伪流式需 GPU");
         return;
     }
@@ -341,7 +371,7 @@ fn pseudo_streaming_whisper_emits_full_events() {
     let pcm = read_wav_16k_mono(&wav);
 
     let (partials, commits, ends, end) = run_realtime(
-        HexBackend::pseudo_streaming(engine(&path)),
+        GgufBackend::pseudo_streaming(engine(&path)),
         Config::default(), // Punct{10s,20s} + partial;partial 每 2s 重转写
         pcm,
     );
@@ -397,7 +427,7 @@ fn pseudo_streaming_qwen_emits_full_events() {
     let pcm: Vec<i16> = one.repeat(3); // ×3 ≈ 15s,硬上限 4s 保证切段
 
     let (partials, commits, ends, end) = run_realtime(
-        HexBackend::pseudo_streaming(engine(&path)),
+        GgufBackend::pseudo_streaming(engine(&path)),
         Config {
             rotate: wxasr_async::policy::RotatePolicy::Punct {
                 soft_ms: 1_500,
@@ -458,8 +488,11 @@ fn pseudo_streaming_with_a_streaming_model_upgrades() {
         return;
     }
 
-    let (partials, commits, ends, end) =
-        run_realtime(HexBackend::pseudo_streaming(engine), Config::default(), pcm);
+    let (partials, commits, ends, end) = run_realtime(
+        GgufBackend::pseudo_streaming(engine),
+        Config::default(),
+        pcm,
+    );
     println!(
         "{} 段 Commit / {} 字 End / {} 个 Partial",
         commits.len(),

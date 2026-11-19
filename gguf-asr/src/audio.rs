@@ -1,5 +1,5 @@
 //! Audio helpers around the 16 kHz mono f32 contract every model here uses,
-//! extracted from Hex's dictation capture: minimum-duration padding and
+//! following Hex's dictation capture: minimum-duration padding and
 //! whole-buffer resampling to 16 kHz.
 
 use std::time::Duration;

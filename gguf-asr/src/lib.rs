@@ -1,7 +1,9 @@
-//! hex-asr — standalone GGUF speech-to-text, extracted from Hex's
-//! Windows/Linux inference stack.
+//! gguf-asr — standalone GGUF speech-to-text. Hex's Windows/Linux inference
+//! stack is the architectural inspiration; this crate is an independent
+//! reimplementation with substantial extensions (diarization, speaker-split,
+//! the unified-layer session contract).
 //!
-//! The layering is Hex's: [`engine`] (one dedicated thread; ordered command
+//! The layering follows Hex's: [`engine`] (one dedicated thread; ordered command
 //! queue, dictation foreground vs. background priority, a 1.5 s
 //! stream-finish deadline that falls back to the whole clip, job deadlines,
 //! bounded waits) → [`local_transcriber`] (GGUF load, device choice,
@@ -10,7 +12,7 @@
 //!
 //! Audio is 16 kHz mono, internally f32. Two entry shapes:
 //!
-//! - Raw f32 ([`Engine`]/[`LiveStream`]), Hex's own surface: feed f32, take
+//! - Raw f32 ([`Engine`]/[`LiveStream`]), mirroring Hex's own surface: feed f32, take
 //!   [`Partial`]s, finish with the authoritative clip.
 //! - Push-based i16 ([`StreamingSession`]), for a unified async layer's
 //!   session contract (wxasr-async's `AsrSession`): push `&[i16]` chunks,
@@ -20,7 +22,7 @@
 //!   [`audio::i16_to_f32`].
 //!
 //! ```no_run
-//! # use hex_asr::{Device, Engine, ModelSpec};
+//! # use gguf_asr::{Device, Engine, ModelSpec};
 //! # fn main() -> eyre::Result<()> {
 //! let spec = ModelSpec::unified_english("parakeet-unified-en.gguf");
 //! let engine = Engine::load(&spec, Device::Auto)?;
@@ -46,6 +48,7 @@
 //! ```
 
 pub mod audio;
+pub mod diarize;
 pub mod engine;
 pub mod gguf_meta;
 pub mod gguf_session;
@@ -59,8 +62,13 @@ pub mod transcript;
 pub mod vad;
 
 pub use audio::{Resampler, SAMPLE_RATE};
+pub use diarize::{
+    Diarizer, SpeakerChunk, SpeakerSplit, SpeakerTurn, assign_speakers, resplit_mixed_segments,
+    speaker_chunks, speaker_split_for, split_transcript,
+};
 pub use engine::{
-    Engine, LiveStream, Offline, Partial, PendingTranscript, Source, Transcribed, YieldingStream,
+    Engine, LiveStream, Offline, Partial, PendingTranscript, PendingTurns, Source, Transcribed,
+    YieldingStream,
 };
 pub use gguf_meta::{GgufMeta, gguf_meta};
 pub use local_transcriber::{Device, LocalTranscriber, ModelSpec};

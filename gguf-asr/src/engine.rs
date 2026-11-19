@@ -7,9 +7,10 @@
 //! that cannot stream always takes the offline path. Commands are handled in
 //! order on one thread, because a live stream holds the model's compute lease.
 //!
-//! Extracted from Hex: Labs gating (live text, stop phrase, skip pauses,
-//! free-memory-when-idle) is gone here. Partial text is always published for
-//! a streaming capture, and long pauses are never cut from a whole clip.
+//! Hex-inspired: Hex's Labs gating (live text, stop phrase, skip pauses,
+//! free-memory-when-idle) is not reimplemented here. Partial text is always
+//! published for a streaming capture, and long pauses are never cut from a
+//! whole clip.
 
 use std::collections::VecDeque;
 mod streaming;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 use eyre::{Result, eyre};
 use transcribe_cpp::CancelToken;
 
+use crate::diarize::{Diarizer, SpeakerSplit, SpeakerTurn};
 use crate::local_transcriber::{Device, LocalTranscriber, ModelSpec};
 use crate::transcript::Transcript;
 use streaming::*;
@@ -130,6 +132,13 @@ pub(crate) enum Command {
         /// The request counter when the work was submitted.
         generation: u64,
         work: Background,
+    },
+    /// Diarizes a clip on the engine's second model, as its own job with its
+    /// own cancellation: a speaker-attributed commit runs this first, then
+    /// transcribes the segment with the turns.
+    Diarize {
+        pcm: Vec<f32>,
+        job: Job,
     },
     Shutdown,
 }
@@ -310,12 +319,17 @@ impl Job {
     fn finish(self, result: Result<Transcribed, String>) {
         let _ = self.reply.send(Reply::Done(result));
     }
+
+    fn finish_turns(self, result: Result<Vec<SpeakerTurn>, String>) {
+        let _ = self.reply.send(Reply::Turns(result));
+    }
 }
 
 enum Reply {
     /// The engine began this job; its deadline starts now.
     Started,
     Done(Result<Transcribed, String>),
+    Turns(Result<Vec<SpeakerTurn>, String>),
 }
 
 #[derive(Debug)]
@@ -398,6 +412,12 @@ pub struct Engine {
     requests: Arc<AtomicU64>,
     /// Whether the loaded model can stream on its device.
     streams: Arc<AtomicBool>,
+    /// Whether a diarize model is loaded alongside the ASR one.
+    diarizes: Arc<AtomicBool>,
+    /// The speaker-split strategy the loaded model's timings make right —
+    /// what [`SpeakerSplit::Auto`] resolves to. Set once at start, from the
+    /// model's capability, never mutated after.
+    split: SpeakerSplit,
     /// Whether dictation streams publish their text as they go.
     live_text: bool,
     /// Whether the worker is running a dictation stream or finish.
@@ -487,6 +507,8 @@ impl PendingTranscript {
             match self.reply.recv_timeout(timeout) {
                 Ok(Reply::Done(result)) => return result,
                 Ok(Reply::Started) => job_deadline = Some(Instant::now() + self.job),
+                // A diarize job's reply never reaches a transcript waiter.
+                Ok(Reply::Turns(_)) => return Err("transcription engine stopped".into()),
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err("transcription engine stopped".into());
                 }
@@ -527,11 +549,87 @@ impl PendingTranscript {
     }
 }
 
+/// A diarize job in flight, with the same bounded waits as a transcript job:
+/// the deadline starts when the engine begins it, so time queued behind other
+/// work is not counted, and a wedged engine fails the job instead of hanging.
+pub struct PendingTurns {
+    reply: Receiver<Reply>,
+    cancel: CancelToken,
+    stalled: Arc<AtomicBool>,
+    /// How long the job may run once started: its allowance plus the clip's.
+    job: Duration,
+}
+
+impl PendingTurns {
+    pub fn wait(self) -> Result<Vec<SpeakerTurn>, String> {
+        let mut job_deadline: Option<Instant> = None;
+        loop {
+            let now = Instant::now();
+            let timeout = job_deadline.map_or(QUEUE_POLL, |deadline| {
+                deadline.saturating_duration_since(now).min(QUEUE_POLL)
+            });
+            match self.reply.recv_timeout(timeout) {
+                Ok(Reply::Turns(result)) => return result,
+                Ok(Reply::Started) => job_deadline = Some(Instant::now() + self.job),
+                // A transcript job's reply never reaches a turns waiter.
+                Ok(Reply::Done(_)) => return Err("transcription engine stopped".into()),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("transcription engine stopped".into());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    let now = Instant::now();
+                    if job_deadline.is_some_and(|deadline| now >= deadline) {
+                        tracing::error!(
+                            deadline_ms = self.job.as_millis() as u64,
+                            "diarization missed its deadline; failing the job"
+                        );
+                        self.stalled.store(true, Ordering::Release);
+                        self.cancel.cancel();
+                        return Err("diarization timed out".into());
+                    }
+                    if job_deadline.is_none() && self.stalled.load(Ordering::Acquire) {
+                        tracing::error!("transcription engine is stuck; failing a queued job");
+                        self.cancel.cancel();
+                        return Err("transcription engine is stuck".into());
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Engine {
     /// Loads `spec` on `device` and starts its dedicated engine thread,
     /// keeping Hex's queueing, priorities, deadlines, and bounded waits.
     pub fn load(spec: &ModelSpec, device: Device) -> Result<Self> {
         Self::start(Model::load(spec, device)?)
+    }
+
+    /// [`Self::load`] with an optional standalone diarize model loaded next
+    /// to the ASR one. A diarize model that fails to load only warns: the
+    /// engine transcribes without speaker attribution ([`Self::diarizes`]
+    /// reports which way it went), never failing the ASR load.
+    pub fn load_with_diarize(
+        spec: &ModelSpec,
+        device: Device,
+        diarize: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let model = Model::load(spec, device)?;
+        // A failed diarize load degrades to no diarization, never fails the engine.
+        let diarizer = match diarize {
+            Some(path) => Diarizer::load(path, device)
+                .map(Some)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        path = path.display().to_string(),
+                        "could not load the diarize model; transcribing without speaker attribution"
+                    );
+                    None
+                }),
+            None => None,
+        };
+        Self::start_with(model, diarizer)
     }
 
     /// The engine's command sender, cloned under its lock.
@@ -554,8 +652,28 @@ impl Engine {
     /// share one loaded model across sessions and threads ([`Engine`] is
     /// `Send + Sync`).
     pub fn start(model: Model) -> Result<Self> {
+        Self::start_with(model, None)
+    }
+
+    /// [`Self::start`] with an optional diarize model the worker owns next to
+    /// the ASR one, so diarize runs serialize with transcriptions on the same
+    /// thread instead of racing for the GPU.
+    pub fn start_with(model: Model, diarizer: Option<Diarizer>) -> Result<Self> {
         let streams = model.stream_options().is_some();
         let streams = Arc::new(AtomicBool::new(streams));
+        let diarizes = Arc::new(AtomicBool::new(diarizer.is_some()));
+        // The runtime truth `SpeakerSplit::Auto` resolves to; the model is
+        // moved into the worker below, so read its capability now. The
+        // header-only guess for before a load is `gguf_meta` +
+        // `speaker_split_for`.
+        let split = if matches!(
+            model.finest_timestamps(),
+            transcribe_cpp::TimestampKind::None
+        ) {
+            SpeakerSplit::Pieces
+        } else {
+            SpeakerSplit::MixedSegments
+        };
         let (commands, receiver) = mpsc::channel();
         let requests = Arc::new(AtomicU64::new(0));
         let running = Running::default();
@@ -563,6 +681,7 @@ impl Engine {
         let dictating = Arc::new(AtomicBool::new(false));
         let worker = Worker {
             model,
+            diarizer,
             running: running.clone(),
             stalled: stalled.clone(),
             streams: streams.clone(),
@@ -570,7 +689,7 @@ impl Engine {
             dictating: dictating.clone(),
         };
         let thread = thread::Builder::new()
-            .name("hexasr-engine".into())
+            .name("ggufasr-engine".into())
             .spawn(move || worker.run(receiver))?;
         Ok(Self {
             commands: Mutex::new(commands),
@@ -578,6 +697,8 @@ impl Engine {
             stalled,
             requests,
             streams,
+            diarizes,
+            split,
             live_text: true,
             dictating,
             next_stream: AtomicU64::new(0),
@@ -597,6 +718,8 @@ impl Engine {
             stalled: Arc::default(),
             requests: Arc::default(),
             streams: Arc::new(AtomicBool::new(true)),
+            diarizes: Arc::new(AtomicBool::new(false)),
+            split: SpeakerSplit::MixedSegments,
             live_text: true,
             dictating: Arc::default(),
             next_stream: AtomicU64::new(0),
@@ -624,6 +747,13 @@ impl Engine {
     #[cfg(test)]
     fn without_live_text(mut self) -> Self {
         self.live_text = false;
+        self
+    }
+
+    /// Pretends a diarize model is loaded, so tests can send its command.
+    #[cfg(test)]
+    fn with_test_diarize(self) -> Self {
+        self.diarizes.store(true, Ordering::Release);
         self
     }
 
@@ -781,6 +911,128 @@ impl Engine {
         self.finish(None, clip)
     }
 
+    /// Whether a diarize model is loaded, so speaker turns can be run at all.
+    pub fn diarizes(&self) -> bool {
+        self.diarizes.load(Ordering::Acquire)
+    }
+
+    /// The speaker-split strategy the loaded model's timings make right —
+    /// what [`SpeakerSplit::Auto`] resolves to, here from the model's real
+    /// capability. The header-only guess for before a load is
+    /// `gguf_meta` + [`crate::speaker_split_for`].
+    pub fn speaker_split(&self) -> SpeakerSplit {
+        self.split
+    }
+
+    /// Diarizes a complete 16 kHz clip on the engine's diarize model, after
+    /// every command already sent. The turns are relative to the clip's
+    /// start, and ids are only self-consistent within this one run. Fails at
+    /// once when no diarize model is loaded (see [`Self::diarizes`]).
+    pub fn diarize(&self, pcm: &[f32]) -> Result<PendingTurns> {
+        if !self.diarizes() {
+            return Err(eyre!("no diarize model is loaded"));
+        }
+        if self.thread.is_none() {
+            return Err(eyre!("transcription engine has no worker thread"));
+        }
+        self.diarize_job(pcm)
+    }
+
+    /// [`Self::diarize`] without the worker check, so tests drive the command
+    /// by hand, as they do `finish_with`.
+    fn diarize_job(&self, pcm: &[f32]) -> Result<PendingTurns> {
+        let (reply, receiver) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let job = self.deadlines.job_for(pcm.len());
+        self.send(Command::Diarize {
+            pcm: pcm.to_vec(),
+            job: Job {
+                cancel: cancel.clone(),
+                reply,
+            },
+        })
+        .map_err(|_| eyre!("transcription engine stopped"))?;
+        Ok(PendingTurns {
+            reply: receiver,
+            cancel,
+            stalled: self.stalled.clone(),
+            job,
+        })
+    }
+
+    /// Transcribes a complete clip with segment and word timings, then merges
+    /// diarize `turns` into its segments: the authoritative speaker-attributed
+    /// text of one rotation segment. `turns` must be on `pcm`'s timeline (a
+    /// rolling-window run needs its offset shifted to the segment first).
+    /// `split` picks the speaker-split strategy — `Auto` resolves against the
+    /// loaded model ([`Self::speaker_split`]) once, here: a model without any
+    /// timing answers one segment per clip however many people spoke, so its
+    /// clip is cut where the turns say the speaker changed and transcribed
+    /// piecewise; a timed model keeps its own segments, re-splitting only
+    /// those that straddle a speaker change. A failed piece falls back to the
+    /// whole-clip run and its whole-segment attribution.
+    pub fn transcribe_clip_turns(
+        &self,
+        pcm: Vec<f32>,
+        turns: Vec<SpeakerTurn>,
+        split: SpeakerSplit,
+    ) -> Result<PendingTranscript> {
+        // Resolve `Auto` against the loaded model now, so a clip's strategy
+        // does not depend on when the engine picks it up.
+        let split = if split == SpeakerSplit::Auto {
+            self.speaker_split()
+        } else {
+            split
+        };
+        self.finish_with(
+            None,
+            pcm,
+            Box::new(move |model, clip| {
+                match split {
+                    SpeakerSplit::Pieces => {
+                        match crate::diarize::split_transcript(&clip, &turns, |piece| {
+                            model.transcribe_timed(piece.to_vec())
+                        }) {
+                            Ok(transcript) => return Ok(transcript),
+                            Err(error) => tracing::warn!(
+                                error = format!("{error:#}"),
+                                "piecewise transcription failed; attributing the whole clip"
+                            ),
+                        }
+                    }
+                    SpeakerSplit::MixedSegments => {
+                        // The re-split needs the audio after the timed run;
+                        // only this branch pays the copy.
+                        let mut transcript = model
+                            .transcribe_timed(clip.clone())
+                            .map_err(|error| format!("{error:#}"))?;
+                        crate::diarize::assign_speakers(&mut transcript, &turns);
+                        let resplit = crate::diarize::resplit_mixed_segments(
+                            &clip,
+                            &mut transcript,
+                            &turns,
+                            |piece| model.transcribe_timed(piece.to_vec()),
+                        );
+                        if resplit > 0 {
+                            tracing::debug!(
+                                resplit,
+                                "re-split segments straddling a speaker change"
+                            );
+                        }
+                        return Ok(transcript);
+                    }
+                    // `Off`, and `Auto` is resolved away above.
+                    SpeakerSplit::Auto | SpeakerSplit::Off => {}
+                }
+                let mut transcript = model
+                    .transcribe_timed(clip)
+                    .map_err(|error| format!("{error:#}"))?;
+                crate::diarize::assign_speakers(&mut transcript, &turns);
+                Ok(transcript)
+            }),
+        )
+    }
+
     /// Runs `work` with the model unless a dictation request was sent first or
     /// a live stream is open, and returns `None` when one was.
     pub fn background<R: Send + 'static>(
@@ -808,7 +1060,7 @@ impl Engine {
     /// on a run still in flight.
     pub fn retire(self) {
         let spawned = thread::Builder::new()
-            .name("hexasr-engine-retire".into())
+            .name("ggufasr-engine-retire".into())
             .spawn(move || drop(self));
         if let Err(error) = spawned {
             tracing::warn!(%error, "could not retire the old transcription engine in the background");
@@ -851,6 +1103,9 @@ pub(crate) const SKIP_LONG_PAUSES: bool = false;
 
 struct Worker {
     model: Model,
+    /// The diarize model, when one was loaded; run only on this thread, so
+    /// it never races an ASR run for the GPU.
+    diarizer: Option<Diarizer>,
     running: Running,
     stalled: Arc<AtomicBool>,
     streams: Arc<AtomicBool>,
@@ -936,6 +1191,9 @@ impl Worker {
                 Command::Background { generation, work } => {
                     let current = self.requests.load(Ordering::Acquire) == generation;
                     work(if current { Some(&mut self.model) } else { None });
+                }
+                Command::Diarize { pcm, job } => {
+                    self.run_diarize(pcm, job);
                 }
                 Command::Shutdown => return,
                 // Stale input for a stream that already ended.
@@ -1110,6 +1368,28 @@ impl Worker {
                     }
                 });
         job.finish(result);
+    }
+
+    /// One diarize run, as a job with its own deadline and cancellation.
+    /// Without a diarize model it answers at once: the caller degrades.
+    fn run_diarize(&mut self, pcm: Vec<f32>, job: Job) {
+        if job.cancel.is_cancelled() {
+            job.finish_turns(Err("diarization was abandoned".into()));
+            return;
+        }
+        // Start the clock and enter the run token before borrowing the
+        // diarizer: locks and borrows taken once, never re-taken while held
+        // (the scrutinee-guard deadlock this codebase already met once).
+        self.start(&job);
+        self.running.enter(&job.cancel);
+        let result = match self.diarizer.as_mut() {
+            Some(diarizer) => {
+                crate::gguf_session::with_job_cancel(&job.cancel, || diarizer.run(&pcm))
+                    .map_err(|error| format!("{error:#}"))
+            }
+            None => Err("no diarize model is loaded".into()),
+        };
+        job.finish_turns(result);
     }
 }
 
@@ -2030,5 +2310,59 @@ mod tests {
         let (engine, _commands) = Engine::for_test();
         assert!(engine.transcribe_clip(Vec::new()).is_err());
         assert!(engine.background(|_| ()).is_err());
+        assert!(!engine.diarizes());
+        assert!(engine.diarize(&[]).is_err());
+    }
+
+    #[test]
+    fn a_diarize_job_sends_one_command_and_answers_through_its_reply() {
+        let (engine, commands) = Engine::for_test();
+        let engine = engine.with_test_diarize();
+        let pending = engine.diarize_job(&[0.0; 1_600]).unwrap();
+        let (pcm, job) = commands
+            .try_iter()
+            .find_map(|command| match command {
+                Command::Diarize { pcm, job } => Some((pcm, job)),
+                _ => None,
+            })
+            .expect("a diarize job was sent");
+        assert_eq!(pcm.len(), 1_600);
+        job.start();
+        job.finish_turns(Ok(vec![super::SpeakerTurn {
+            start_ms: 0,
+            end_ms: 100,
+            speaker: 1,
+            p: 0.9,
+        }]));
+        let turns = pending.wait().unwrap();
+        assert_eq!(
+            turns.as_slice(),
+            [{
+                super::SpeakerTurn {
+                    start_ms: 0,
+                    end_ms: 100,
+                    speaker: 1,
+                    p: 0.9,
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn a_queued_diarize_job_behind_a_wedged_engine_fails_fast() {
+        let (reply, receiver) = mpsc::channel();
+        // Hold the sender open: the waiter must learn the engine is wedged
+        // from the stalled flag, not from a dropped channel.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+            drop(reply);
+        });
+        let pending = PendingTurns {
+            reply: receiver,
+            cancel: CancelToken::new(),
+            stalled: Arc::new(AtomicBool::new(true)),
+            job: SHORT.job,
+        };
+        assert_eq!(pending.wait().unwrap_err(), "transcription engine is stuck");
     }
 }

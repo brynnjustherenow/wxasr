@@ -42,10 +42,10 @@ while let Some(ev) = rx.recv().await {
 
 - `backend_wxasr`（默认，`start` 即它）：微信输入法 `.xnet` 模型，
   多段 `Final` 上下文轮换
-- `backend_hex`（`--features hex`，需 CMake + Vulkan SDK 构建）：
+- `backend_gguf`（`--features gguf`，需 CMake + Vulkan SDK 构建）：
   GGUF 推理栈（whisper/Qwen 等，Vulkan GPU 优先），一次会话恰一个
-  `Final`，富字段直通（`language` 等）；`HEXASR_MODEL` 门控的集成
-  测试见 `tests/hex_backend.rs`
+  `Final`，富字段直通（`language` 等）；`GGUFASR_MODEL` 门控的集成
+  测试见 `tests/gguf_backend.rs`
 
 ## 配置
 

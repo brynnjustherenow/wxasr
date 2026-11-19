@@ -11,14 +11,14 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 uuid = { version = "1", features = ["v7"] }
 eyre = "0.6.14"
 rubato = "5.0.1"
-# backend_hex 的 VAD 降级告警;仅 hex feature 使用
+# backend_gguf 的 VAD 降级告警;仅 gguf feature 使用
 tracing = { version = "0.1", optional = true }
-hex-asr = { path = "../hex-asr", optional = true }
+gguf-asr = { path = "../gguf-asr", optional = true }
 
 [features]
-# hex-asr 后端(transcribe-cpp GGUF 推理栈):默认不开,启用需要
-# CMake + Vulkan SDK 的构建环境(见 hex-asr 的文档)
-hex = ["dep:hex-asr", "dep:tracing"]
+# gguf-asr 后端(transcribe-cpp GGUF 推理栈):默认不开,启用需要
+# CMake + Vulkan SDK 的构建环境(见 gguf-asr 的文档)
+gguf = ["dep:gguf-asr", "dep:tracing"]
 
 [dev-dependencies]
 hound = "3"

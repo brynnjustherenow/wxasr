@@ -7,8 +7,8 @@
 //! 全部由后端自持,不进 async 执行器。
 //!
 //! wxasr 是第一个后端([`backend_wxasr::WxasrBackend`]):VAD、partial
-//! 节流与 [`policy`] 轮换都住在那里,经 [`start`] 开箱即用;hex-asr
-//! 后端([`backend_hex::HexBackend`],`hex` feature)实现同一契约,自带
+//! 节流与 [`policy`] 轮换都住在那里,经 [`start`] 开箱即用;gguf-asr
+//! 后端([`backend_gguf::GgufBackend`],`gguf` feature)实现同一契约,自带
 //! 轮换(native 流一次性,轮换 = 老流 finish + 新流)与 Silero VAD
 //! endpointing。各后端经 [`start_with`] 接入,共享同一套线程/通道桥与
 //! 事件流(会话语义见各后端模块文档)。
@@ -64,8 +64,8 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use wxasr::Model;
-#[cfg(feature = "hex")]
-pub mod backend_hex;
+#[cfg(feature = "gguf")]
+pub mod backend_gguf;
 pub mod backend_wxasr;
 pub mod policy;
 pub mod preprocess;

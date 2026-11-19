@@ -317,6 +317,13 @@ impl LocalTranscriber {
         self.stream.as_ref()
     }
 
+    /// The finest timestamp kind this model can answer at (its capability,
+    /// as runs ask for it); `None` means text-only transcripts, with no rows
+    /// to merge diarize turns into.
+    pub fn finest_timestamps(&self) -> transcribe_cpp::TimestampKind {
+        self.finest_timestamps
+    }
+
     /// Silence a live stream of this model hears before it finalizes, the
     /// same trailing silence its whole-clip runs get.
     pub fn stream_trailing_silence(&self) -> usize {

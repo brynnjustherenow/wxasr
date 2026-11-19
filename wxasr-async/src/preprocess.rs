@@ -2,7 +2,7 @@
 //!
 //! 统一层不写死采样率:调用方在 [`crate::AudioIn`] 里声明自己的格式,
 //! [`InputConverter`] 在会话内部把交错的任意采样率/声道 i16 逐步转换
-//! 成 16 kHz 单声道 i16(wxasr 与 hex 两条后端链的公共输入),调用方
+//! 成 16 kHz 单声道 i16(wxasr 与 gguf 两条后端链的公共输入),调用方
 //! 无感。16 kHz 单声道本身就是目标格式,直通零开销。
 
 use crate::AudioIn;
@@ -105,7 +105,7 @@ fn resample_chunk(resampler: &mut Fft<f32>, samples: &[f32], partial: bool) -> V
         .take_data()
 }
 
-/// 任意采样率 → 16 kHz 的流式重采样(hex-asr `audio::Resampler` 的
+/// 任意采样率 → 16 kHz 的流式重采样(gguf-asr `audio::Resampler` 的
 /// 同源实现):输出先扣除重采样延迟,`finish` 后的总长与整段转换一致。
 struct Resampler {
     source_rate: u32,
