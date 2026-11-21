@@ -10,12 +10,21 @@ eyre = "0.6.14"
 rubato = "5.0.1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
-transcribe-cpp = { version = "=0.4.1", features = ["vulkan"] }
 # Pin the native half to the exact version the 0.4.1 bindings check for at
 # load: their "0.4.1" requirement otherwise resolves to transcribe-cpp-sys
 # 0.4.2, whose native library reports 0.4.2 and is rejected by the
 # pre-1.0 base-version lock ("native library version mismatch").
 transcribe-cpp-sys = "=0.4.1"
+
+# GPU 后端按平台选(fork 的 build.rs:metal 只在 Apple 目标生效并嵌入
+# metallib;vulkan 在 Apple 上会因找不到 Vulkan SDK 配置直接失败)。
+# 安全 crate 的 API 不随后端 feature 变化,拆分无感。
+# 注意 TOML:[target.*] 表会吞并其后直到下一表头的普通依赖,故置于段尾。
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+transcribe-cpp = { version = "=0.4.1", default-features = false, features = ["metal"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
+transcribe-cpp = { version = "=0.4.1", default-features = false, features = ["vulkan"] }
 
 [dev-dependencies]
 hound = "3"
