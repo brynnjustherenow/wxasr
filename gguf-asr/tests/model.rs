@@ -509,3 +509,96 @@ fn a_two_speaker_clip_splits_into_speaker_segments() {
         );
     }
 }
+
+/// `transcribe_clip_diarized` is the one-call batch form: one whole-clip
+/// diarize run feeding the speaker-attributed transcription. Where the manual
+/// composition above drives the pieces, this locks the composition itself —
+/// the transcript comes back attributed, which the plain one-shot
+/// (`transcribe_clip`) never is. Gated the same way; also skips when the mix
+/// itself does not separate.
+#[test]
+fn transcribe_clip_diarized_attributes_speakers() {
+    let engine = engine_or_skip!();
+    if !engine.diarizes() {
+        return; // no GGUFASR_DIARIZE_MODEL
+    }
+    let wav = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/sortformer-2spk-mix.wav"
+    );
+    if !std::path::Path::new(wav).is_file() {
+        eprintln!("skipping: {wav} does not exist");
+        return;
+    }
+    let samples = wav_samples(wav);
+    let started = Instant::now();
+    let transcript = engine
+        .transcribe_clip_diarized(samples)
+        .expect("the diarized one-shot finishes");
+    println!(
+        "diarized one-shot: {} segments in {} ms: {:?}",
+        transcript.segments.len(),
+        started.elapsed().as_millis(),
+        transcript.text
+    );
+    assert!(
+        !transcript.text.trim().is_empty(),
+        "a speech mix must transcribe to text"
+    );
+    assert!(
+        transcript
+            .segments
+            .iter()
+            .all(|segment| !segment.text.trim().is_empty()),
+        "every segment must carry text: {:?}",
+        transcript.segments
+    );
+    assert!(
+        transcript
+            .segments
+            .iter()
+            .any(|segment| segment.speaker.is_some()),
+        "the diarized one-shot attributes at least one speaker: {:?}",
+        transcript.segments
+    );
+}
+
+/// Without a diarize model the same call must answer with the plain one-shot
+/// transcript instead of failing — the degrade path callers rely on when the
+/// Sortformer model is absent or its load failed. Runs only when the shared
+/// engine carries no diarize model (unset `GGUFASR_DIARIZE_MODEL`).
+#[test]
+fn transcribe_clip_diarized_degrades_without_a_diarize_model() {
+    let engine = engine_or_skip!();
+    if engine.diarizes() {
+        return; // shared engine carries the diarize model; nothing to degrade
+    }
+    let wav = std::env::var("GGUFASR_WAV").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../wxasr/tests/data/tts_short_1.wav"
+        )
+        .to_string()
+    });
+    if !std::path::Path::new(&wav).is_file() {
+        eprintln!("skipping: {wav} does not exist");
+        return;
+    }
+    let samples = wav_samples(&wav);
+    let transcript = engine
+        .transcribe_clip_diarized(samples)
+        .expect("the one-shot degrades to the plain transcription");
+    assert!(
+        !transcript.text.trim().is_empty(),
+        "the degraded one-shot still transcribes: {:?}",
+        transcript.text
+    );
+    assert!(
+        transcript
+            .segments
+            .iter()
+            .all(|segment| segment.speaker.is_none()),
+        "no diarize model means no speaker on any segment: {:?}",
+        transcript.segments
+    );
+}

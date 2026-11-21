@@ -1033,6 +1033,39 @@ impl Engine {
         )
     }
 
+    /// One-shot offline transcription with speaker attribution: diarizes the
+    /// whole clip once, then transcribes it with those turns. A single
+    /// whole-clip run keeps speaker ids self-consistent across the entire
+    /// audio, which a rolling-window run cannot promise. Degrades to
+    /// [`Self::transcribe_clip`] when no diarize model is loaded or the run
+    /// yields no turns. Blocking — the diarize half waits on the engine
+    /// thread, so call this from a worker thread.
+    pub fn transcribe_clip_diarized(&self, pcm: Vec<f32>) -> Result<Transcript> {
+        if !self.diarizes() {
+            return self.plain_transcript(pcm);
+        }
+        let turns = self
+            .diarize(&pcm)?
+            .wait()
+            .map_err(|error| eyre!("{error}"))?;
+        if turns.is_empty() {
+            return self.plain_transcript(pcm);
+        }
+        self.transcribe_clip_turns(pcm, turns, self.speaker_split())?
+            .wait()
+            .map(|done| done.transcript)
+            .map_err(|error| eyre!("{error}"))
+    }
+
+    /// [`Self::transcribe_clip_diarized`]'s degrade path: the plain one-shot
+    /// transcript, blocking as its caller already is.
+    fn plain_transcript(&self, pcm: Vec<f32>) -> Result<Transcript> {
+        self.transcribe_clip(pcm)?
+            .wait()
+            .map(|done| done.transcript)
+            .map_err(|error| eyre!("{error}"))
+    }
+
     /// Runs `work` with the model unless a dictation request was sent first or
     /// a live stream is open, and returns `None` when one was.
     pub fn background<R: Send + 'static>(
