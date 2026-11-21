@@ -213,7 +213,8 @@ impl DesktopAudio {
                 .ok_or_else(|| {
                     Error::Unsupported(
                         "未找到桌面回环设备：Linux 需要 PulseAudio/PipeWire monitor 源，\
-                         macOS 需要安装 BlackHole 等虚拟设备",
+                         macOS 需要安装 BlackHole 等虚拟设备"
+                            .to_string(),
                     )
                 })?,
         };
