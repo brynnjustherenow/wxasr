@@ -24,6 +24,7 @@ fn main() {
     let mut model = None;
     let mut wavs = Vec::new();
     let (mut lang, mut device, mut repeat) = (None, Device::Auto, 1usize);
+    let mut realtime = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -36,6 +37,7 @@ fn main() {
                 }
             }
             "--repeat" => repeat = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
+            "--realtime" => realtime = true,
             _ if model.is_none() => model = Some(a),
             _ => wavs.push(a),
         }
@@ -66,6 +68,9 @@ fn main() {
             let t = Instant::now();
             let mut partials = 0;
             for c in clip.chunks(1600) {
+                if realtime {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
                 s.feed(c);
                 if s.take_partial().is_some() {
                     partials += 1;
@@ -75,9 +80,9 @@ fn main() {
             let t2 = Instant::now();
             let r = engine.finish(Some(s), clip.clone()).unwrap().wait().expect("stream");
             println!(
-                "{name} stream feed {fed}ms finish {}ms partials={partials} source={}\t{}",
+                "{name} stream feed {fed}ms finish {}ms partials={partials} source={:?}\t{}",
                 t2.elapsed().as_millis(),
-                r.source.label(),
+                r.source,
                 r.text()
             );
         }
