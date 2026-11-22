@@ -55,6 +55,14 @@ impl SpeechFrames {
     /// How `frame`, the next `FRAME_SAMPLES` samples, sits against the noise
     /// floor.
     pub fn classify(&mut self, frame: &[f32]) -> FrameLevel {
+        // An empty frame carries no level: measuring it would read as
+        // 0 dBFS and pin the noise floor there for good.
+        if frame.is_empty() {
+            return FrameLevel {
+                quiet: true,
+                speech: false,
+            };
+        }
         let (level_db, floor_db) = self.measure(frame);
         FrameLevel {
             quiet: level_db <= (floor_db + QUIET_MARGIN_DB).max(QUIET_MINIMUM_DB),

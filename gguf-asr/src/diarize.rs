@@ -148,7 +148,9 @@ impl Diarizer {
 /// a whole-span speaker is the reader's roll-up, not this merge's.
 pub fn assign_speakers(transcript: &mut Transcript, turns: &[SpeakerTurn]) {
     for segment in &mut transcript.segments {
-        segment.speaker = speaker_for(segment.start_ms, segment.end_ms, turns);
+        // No overlapping turn keeps the model's own label, if it had one.
+        segment.speaker =
+            speaker_for(segment.start_ms, segment.end_ms, turns).or(segment.speaker);
     }
 }
 
@@ -162,20 +164,22 @@ fn speaker_for(start_ms: i64, end_ms: i64, turns: &[SpeakerTurn]) -> Option<u32>
         if overlap <= 0 {
             continue;
         }
+        // NaN is "unset": it must never outrank a real probability.
+        let p = if turn.p.is_nan() { 0.0 } else { turn.p };
         match totals
             .iter_mut()
             .find(|(speaker, _, _)| *speaker == turn.speaker)
         {
             Some((_, overlap_sum, p_sum)) => {
                 *overlap_sum += overlap;
-                *p_sum += turn.p;
+                *p_sum += p;
             }
-            None => totals.push((turn.speaker, overlap, turn.p)),
+            None => totals.push((turn.speaker, overlap, p)),
         }
     }
     totals
         .into_iter()
-        .max_by(|a, b| (a.1, a.2.to_bits()).cmp(&(b.1, b.2.to_bits())))
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)))
         .map(|(speaker, _, _)| speaker)
 }
 
@@ -400,6 +404,9 @@ pub fn resplit_mixed_segments(
         }
         let mut rows: Vec<TranscriptSegment> = Vec::new();
         let mut failed = false;
+        // Pieces push words as they go; a segment kept whole must take its
+        // pieces' words back out, or they duplicate the model's own.
+        let words_before = piece_words.len();
         let start = (segment.start_ms.max(0) as usize * 16).min(pcm.len());
         let end = (segment.end_ms.max(0) as usize * 16).min(pcm.len());
         if end > start {
@@ -450,6 +457,7 @@ pub fn resplit_mixed_segments(
             }
         }
         if failed || rows.is_empty() {
+            piece_words.truncate(words_before);
             segments.push(segment);
             continue;
         }
@@ -465,7 +473,14 @@ pub fn resplit_mixed_segments(
         for (start_ms, end_ms) in &spans {
             transcript
                 .words
-                .retain(|word| !(word.start_ms >= *start_ms && word.end_ms <= *end_ms));
+                // A word belongs to the span its midpoint falls in: model
+                // word times overrun segment bounds by a few ms, and a
+                // containment test would keep a straddler the pieces
+                // transcribe again.
+                .retain(|word| {
+                    let mid = word.start_ms + (word.end_ms - word.start_ms) / 2;
+                    !(mid >= *start_ms && mid < *end_ms)
+                });
         }
         transcript.words.extend(piece_words);
         transcript.words.sort_by_key(|word| word.start_ms);

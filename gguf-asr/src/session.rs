@@ -122,14 +122,18 @@ impl StreamingSession {
             return;
         };
         stream.feed(&self.converted);
-        if self.partials
-            && let Some(partial) = stream.take_partial()
-        {
-            let text = partial_text(&partial);
-            self.committed = partial.stable;
-            if !text.is_empty() && !out.emit(SessionEvent::Partial(text)) {
-                self.close();
+        // Always drain the partial: `committed` feeds rotation policies even
+        // when the consumer asked for no partial events.
+        if let Some(partial) = stream.take_partial() {
+            if self.partials {
+                let text = partial_text(&partial);
+                if !text.is_empty() && !out.emit(SessionEvent::Partial(text)) {
+                    self.committed = partial.stable;
+                    self.close();
+                    return;
+                }
             }
+            self.committed = partial.stable;
         }
     }
 
