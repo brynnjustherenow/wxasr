@@ -34,6 +34,11 @@ pub struct Stream {
     committed: Vec<u32>,
     /// 已定稿覆盖到的特征帧位置
     cursor: usize,
+    /// 中间结果的「软定稿」缓存：`partial` 解码时把右文足够（≥POST 帧）
+    /// 的前缀存下来，下次只解码 `soft_cursor` 之后，避免每次都重算整个
+    /// 未定稿尾部。只影响中间结果；真正定稿（`commit`）时清空
+    soft: Vec<u32>,
+    soft_cursor: usize,
     /// 接续携带的左文帧数（见 [`Stream::rotate`]），自有内容从该位置起
     lead: usize,
     fresh: usize,
@@ -59,6 +64,8 @@ impl Stream {
             frames: Vec::new(),
             committed: Vec::new(),
             cursor: 0,
+            soft: Vec::new(),
+            soft_cursor: 0,
             lead: 0,
             fresh: 0,
             punct,
@@ -83,13 +90,18 @@ impl Stream {
     /// 解码 `[cursor - prev, end)` 并在尾部补 `pad` 帧静音，
     /// 返回 cursor 之后的输出帧 id
     fn decode(&self, prev: usize, end: usize, pad: usize) -> Vec<u32> {
-        let a = self.cursor.saturating_sub(prev);
+        self.decode_from(self.cursor, prev, end, pad)
+    }
+
+    /// 同 [`decode`](Self::decode)，但以任意 `start`（而非 `cursor`）为界
+    fn decode_from(&self, start: usize, prev: usize, end: usize, pad: usize) -> Vec<u32> {
+        let a = start.saturating_sub(prev);
         let mut x: Vec<[f32; DIM]> = self.frames[a..end].to_vec();
         if pad > 0 {
             x.resize(x.len() + pad, self.fbank.silence());
         }
         let ids = self.model.forward(&x);
-        ids.get((self.cursor - a) / 5..)
+        ids.get((start - a) / 5..)
             .map(|s| s.to_vec())
             .unwrap_or_default()
     }
@@ -108,6 +120,8 @@ impl Stream {
         }
         self.cursor += ids.len() * 5;
         self.committed.extend(ids);
+        self.soft.clear();
+        self.soft_cursor = self.cursor;
     }
 
     /// 中间结果：已定稿部分 + 尾部临时解码（前文减半省算力）。
@@ -115,10 +129,26 @@ impl Stream {
     /// 每次调用都会触发一次解码，调用方应按 [`fresh`](Self::fresh) 节流。
     pub fn partial(&mut self) -> String {
         self.fresh = 0;
-        let mut ids = self.committed.clone();
-        if self.frames.len() > self.cursor {
-            ids.extend(self.decode(PREV / 2, self.frames.len(), PAD));
+        let len = self.frames.len();
+        let s = self.cursor.max(self.soft_cursor);
+        let mut tail = if len > s {
+            self.decode_from(s, PREV / 2, len, PAD)
+        } else {
+            Vec::new()
+        };
+        // 右文 ≥ POST 帧的前缀已足够稳定，在其中最后一对连续 blank 处
+        // 切开存入软缓存，下次从切点起解码
+        if len > s + POST {
+            let stable = ((len - POST - s) / 5).min(tail.len());
+            if let Some(c) = (1..stable).rev().find(|&c| tail[c] == 0 && tail[c - 1] == 0) {
+                self.soft.extend(tail.drain(..c));
+                self.soft_cursor = s + c * 5;
+            }
         }
+        let mut ids = Vec::with_capacity(self.committed.len() + self.soft.len() + tail.len());
+        ids.extend_from_slice(&self.committed);
+        ids.extend_from_slice(&self.soft);
+        ids.extend(tail);
         tidy(&self.model.text(&ids))
             .trim_end_matches(PUNCT)
             .to_string()
@@ -210,6 +240,8 @@ impl Stream {
                 fresh: frames.len() - lead,
                 frames,
                 committed: Vec::new(),
+                soft: Vec::new(),
+                soft_cursor: lead,
                 punct: self.punct,
             },
         )
