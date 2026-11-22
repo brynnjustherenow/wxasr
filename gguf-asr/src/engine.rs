@@ -58,6 +58,16 @@ const QUEUE_POLL: Duration = Duration::from_millis(250);
 /// How long dropping the engine waits for its thread. A native run that cannot
 /// be aborted is left to finish on its own.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+/// The last-resort bound on a job the engine never starts, on top of its own
+/// run allowance. Queue time is legitimate (a long diarize ahead of it), so
+/// this is generous; it only exists so a job whose `Started` never arrives —
+/// a native stream open that blocks, a stream finish that ignores its
+/// cancel, a run nobody else timed out — fails instead of hanging forever.
+const QUEUE_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// How long a queued waiter must keep seeing the stalled flag before it gives
+/// up. A timed-out run that returns right after its timeout lets the worker
+/// start the next job and clear the flag; that job must not fail meanwhile.
+const STALL_GRACE: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Copy)]
 struct Deadlines {
@@ -65,6 +75,8 @@ struct Deadlines {
     job: Duration,
     job_seconds_per_audio_second: u32,
     shutdown: Duration,
+    queue: Duration,
+    stall_grace: Duration,
 }
 
 impl Deadlines {
@@ -73,6 +85,8 @@ impl Deadlines {
         job: JOB_DEADLINE,
         job_seconds_per_audio_second: JOB_SECONDS_PER_AUDIO_SECOND,
         shutdown: SHUTDOWN_DEADLINE,
+        queue: QUEUE_DEADLINE,
+        stall_grace: STALL_GRACE,
     };
 
     fn job_for(&self, samples: usize) -> Duration {
@@ -459,11 +473,16 @@ impl LiveStream {
         if samples.is_empty() {
             return;
         }
-        self.fed += samples.len();
-        let _ = self.commands.send(Command::Feed {
+        // Count only audio the engine was handed: a closed engine drops it,
+        // and `fed` must not claim otherwise.
+        let sent = self.commands.send(Command::Feed {
             stream: self.id,
             samples: samples.to_vec(),
         });
+        match sent {
+            Ok(()) => self.fed += samples.len(),
+            Err(_) => tracing::debug!(stream = self.id, "engine stopped; dropping fed audio"),
+        }
     }
 }
 
@@ -486,6 +505,10 @@ pub struct PendingTranscript {
     /// How long the job may run once started: its allowance plus the clip's.
     job: Duration,
     stream_finish: Duration,
+    /// When a job the engine never started gives up.
+    queue_deadline: Instant,
+    /// How long the stalled flag must hold before a queued job fails on it.
+    stall_grace: Duration,
 }
 
 impl PendingTranscript {
@@ -495,6 +518,7 @@ impl PendingTranscript {
             .as_ref()
             .map(|_| Instant::now() + self.stream_finish);
         let mut job_deadline: Option<Instant> = None;
+        let mut stalled_since: Option<Instant> = None;
         loop {
             let now = Instant::now();
             let timeout = [stream_deadline, job_deadline]
@@ -530,10 +554,17 @@ impl PendingTranscript {
                         self.abandon();
                         return Err("transcription timed out".into());
                     }
-                    if job_deadline.is_none() && self.stalled.load(Ordering::Acquire) {
-                        tracing::error!("transcription engine is stuck; failing a queued job");
-                        self.abandon();
-                        return Err("transcription engine is stuck".into());
+                    if job_deadline.is_none() {
+                        if queued_is_stuck(&self.stalled, &mut stalled_since, now, self.stall_grace) {
+                            tracing::error!("transcription engine is stuck; failing a queued job");
+                            self.abandon();
+                            return Err("transcription engine is stuck".into());
+                        }
+                        if now >= self.queue_deadline {
+                            tracing::error!("transcription never started; failing the queued job");
+                            self.abandon();
+                            return Err("transcription never started".into());
+                        }
                     }
                 }
             }
@@ -558,11 +589,33 @@ pub struct PendingTurns {
     stalled: Arc<AtomicBool>,
     /// How long the job may run once started: its allowance plus the clip's.
     job: Duration,
+    /// When a job the engine never started gives up.
+    queue_deadline: Instant,
+    /// How long the stalled flag must hold before a queued job fails on it.
+    stall_grace: Duration,
+}
+
+/// Whether a queued (not yet started) job should give up on a stalled
+/// engine: the flag must hold for `grace`, so a run that returns just after
+/// timing out, letting the worker start the next job, fails nothing.
+fn queued_is_stuck(
+    stalled: &AtomicBool,
+    since: &mut Option<Instant>,
+    now: Instant,
+    grace: Duration,
+) -> bool {
+    if !stalled.load(Ordering::Acquire) {
+        *since = None;
+        return false;
+    }
+    let first = *since.get_or_insert(now);
+    now.duration_since(first) >= grace
 }
 
 impl PendingTurns {
     pub fn wait(self) -> Result<Vec<SpeakerTurn>, String> {
         let mut job_deadline: Option<Instant> = None;
+        let mut stalled_since: Option<Instant> = None;
         loop {
             let now = Instant::now();
             let timeout = job_deadline.map_or(QUEUE_POLL, |deadline| {
@@ -587,10 +640,17 @@ impl PendingTurns {
                         self.cancel.cancel();
                         return Err("diarization timed out".into());
                     }
-                    if job_deadline.is_none() && self.stalled.load(Ordering::Acquire) {
-                        tracing::error!("transcription engine is stuck; failing a queued job");
-                        self.cancel.cancel();
-                        return Err("transcription engine is stuck".into());
+                    if job_deadline.is_none() {
+                        if queued_is_stuck(&self.stalled, &mut stalled_since, now, self.stall_grace) {
+                            tracing::error!("transcription engine is stuck; failing a queued job");
+                            self.cancel.cancel();
+                            return Err("transcription engine is stuck".into());
+                        }
+                        if now >= self.queue_deadline {
+                            tracing::error!("diarization never started; failing the queued job");
+                            self.cancel.cancel();
+                            return Err("diarization never started".into());
+                        }
                     }
                 }
             }
@@ -902,6 +962,8 @@ impl Engine {
             stalled: self.stalled.clone(),
             job,
             stream_finish: self.deadlines.stream_finish,
+            queue_deadline: Instant::now() + self.deadlines.queue + job,
+            stall_grace: self.deadlines.stall_grace,
         })
     }
 
@@ -957,6 +1019,8 @@ impl Engine {
             cancel,
             stalled: self.stalled.clone(),
             job,
+            queue_deadline: Instant::now() + self.deadlines.queue + job,
+            stall_grace: self.deadlines.stall_grace,
         })
     }
 
@@ -2220,6 +2284,8 @@ mod tests {
         job: Duration::from_millis(100),
         job_seconds_per_audio_second: 0,
         shutdown: Duration::from_millis(100),
+        queue: Duration::from_millis(300),
+        stall_grace: Duration::from_millis(0),
     };
 
     fn silent() -> Offline {
@@ -2325,6 +2391,46 @@ mod tests {
     }
 
     #[test]
+    fn a_job_the_engine_never_starts_fails_at_its_queue_deadline() {
+        let (engine, commands) = Engine::for_test();
+        let engine = engine.with_deadlines(SHORT);
+        // Nobody times out ahead of it, so the stalled flag never rises.
+        let pending = engine.finish_with(None, Vec::new(), silent()).unwrap();
+        let job = next_job(&commands);
+        let started = Instant::now();
+        assert_eq!(pending.wait().unwrap_err(), "transcription never started");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(job.cancel.is_cancelled(), "the engine skips it later");
+    }
+
+    #[test]
+    fn a_queued_job_survives_a_stall_that_clears_within_the_grace() {
+        let (engine, commands) = Engine::for_test();
+        let engine = engine.with_deadlines(Deadlines {
+            stall_grace: Duration::from_millis(600),
+            queue: Duration::from_secs(5),
+            ..SHORT
+        });
+        let pending = engine.finish_with(None, Vec::new(), silent()).unwrap();
+        let job = next_job(&commands);
+        engine.stalled.store(true, Ordering::Release);
+        let stalled = engine.stalled.clone();
+        let worker = thread::spawn(move || {
+            // The wedged run returns; the worker starts this job.
+            thread::sleep(Duration::from_millis(300));
+            stalled.store(false, Ordering::Release);
+            job.start();
+            job.finish(Ok(Transcribed {
+                transcript: text_transcript("still here"),
+                source: Source::Offline,
+                finish_ms: 0,
+            }));
+        });
+        assert_eq!(pending.wait().unwrap().text(), "still here");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn the_job_deadline_grows_with_the_clip() {
         let (engine, _commands) = Engine::for_test_without_streaming();
         let pending = engine
@@ -2395,6 +2501,8 @@ mod tests {
             cancel: CancelToken::new(),
             stalled: Arc::new(AtomicBool::new(true)),
             job: SHORT.job,
+            queue_deadline: Instant::now() + Duration::from_secs(60),
+            stall_grace: SHORT.stall_grace,
         };
         assert_eq!(pending.wait().unwrap_err(), "transcription engine is stuck");
     }
