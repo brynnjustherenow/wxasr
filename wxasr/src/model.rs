@@ -423,13 +423,26 @@ fn gelu(x: f32) -> f32 {
 
 /// 8 头全注意力（非因果），输出拼回 [t, D]
 fn attention(q: &[f32], k: &[f32], v: &[f32], t: usize) -> Vec<f32> {
+    // K/V 重排为按头连续 [HEADS][t][HD]:内层扫 j 时顺序访存,
+    // 而非每行跨 D 步长只取 HD 个元素(原布局每个 cache line 只用 1/8)
+    let heads = |x: &[f32]| {
+        let mut y = vec![0f32; t * D];
+        for j in 0..t {
+            for h in 0..HEADS {
+                y[(h * t + j) * HD..(h * t + j + 1) * HD]
+                    .copy_from_slice(&x[j * D + h * HD..j * D + (h + 1) * HD]);
+            }
+        }
+        y
+    };
+    let (k, v) = (heads(k), heads(v));
     let mut out = vec![0f32; t * D];
-    out.par_chunks_mut(D).enumerate().for_each(|(i, o)| {
-        let mut scores = vec![0f32; t];
+    out.par_chunks_mut(D).enumerate().for_each_init(|| vec![0f32; t], |scores, (i, o)| {
         for h in 0..HEADS {
             let qs = &q[i * D + h * HD..i * D + (h + 1) * HD];
-            for (j, s) in scores.iter_mut().enumerate() {
-                *s = dotf(qs, &k[j * D + h * HD..j * D + (h + 1) * HD]) * ATT_SCALE;
+            let kh = &k[h * t * HD..(h + 1) * t * HD];
+            for (s, kr) in scores.iter_mut().zip(kh.chunks_exact(HD)) {
+                *s = dotf(qs, kr) * ATT_SCALE;
             }
             let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut z = 0.0;
@@ -438,9 +451,10 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], t: usize) -> Vec<f32> {
                 z += *s;
             }
             let oh = &mut o[h * HD..(h + 1) * HD];
-            for (j, &a) in scores.iter().enumerate() {
-                let w = a / z;
-                let vh = &v[j * D + h * HD..j * D + (h + 1) * HD];
+            let vhs = &v[h * t * HD..(h + 1) * t * HD];
+            let inv = 1.0 / z;
+            for (&a, vh) in scores.iter().zip(vhs.chunks_exact(HD)) {
+                let w = a * inv;
                 for d in 0..HD {
                     oh[d] += w * vh[d];
                 }

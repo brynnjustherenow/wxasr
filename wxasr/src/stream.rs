@@ -100,7 +100,7 @@ impl Stream {
         let mut ids = self.decode(PREV, self.cursor + BLK + POST, PAD);
         ids.truncate(BLK / 5);
         // 在块后半段找最后一对连续 blank，在其前截断
-        if let Some(c) = (ids.len() / 2..ids.len())
+        if let Some(c) = ((ids.len() / 2).max(1)..ids.len())
             .rev()
             .find(|&c| ids[c] == 0 && ids[c - 1] == 0)
         {
