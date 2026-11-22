@@ -6,3 +6,10 @@ members = [
     'wxasr-provider',
     "gguf-asr",
 ]
+exclude = ["vendor"]
+
+# transcribe.cpp 走我们的 fork(vendor/transcribe.cpp submodule,分支 wxasr/main):
+# 基于 bcb639f + Vulkan BDA 修复(Kirin/Maleoon)。版本号仍是 0.4.1,满足 gguf-asr 的 =0.4.1 锁定。
+[patch.crates-io]
+transcribe-cpp-sys = { path = "vendor/transcribe.cpp" }
+transcribe-cpp = { path = "vendor/transcribe.cpp/bindings/rust/transcribe-cpp" }

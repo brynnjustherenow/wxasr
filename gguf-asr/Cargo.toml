@@ -10,10 +10,9 @@ eyre = "0.6.14"
 rubato = "5.0.1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
-# Pin the native half to the exact version the 0.4.1 bindings check for at
-# load: their "0.4.1" requirement otherwise resolves to transcribe-cpp-sys
-# 0.4.2, whose native library reports 0.4.2 and is rejected by the
-# pre-1.0 base-version lock ("native library version mismatch").
+# 实际源码由根 Cargo.toml 的 [patch.crates-io] 指向 fork
+# (vendor/transcribe.cpp submodule, 分支 wxasr/main)。=0.4.1 仍保留:
+# 绑定在加载时校验原生库版本(pre-1.0 base-version lock),两半必须一致。
 transcribe-cpp-sys = "=0.4.1"
 
 # GPU 后端按平台选(fork 的 build.rs:metal 只在 Apple 目标生效并嵌入

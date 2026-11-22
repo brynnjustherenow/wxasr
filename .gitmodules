@@ -1,0 +1,4 @@
+[submodule "vendor/transcribe.cpp"]
+	path = vendor/transcribe.cpp
+	url = git@github.com:brynnjustherenow/transcribe.cpp.git
+	branch = wxasr/main
