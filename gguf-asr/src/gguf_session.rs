@@ -349,8 +349,7 @@ impl OfflineGgufSession {
                 );
                 continue;
             }
-            let mut chunk = samples.to_vec();
-            crate::audio::pad_minimum(&mut chunk);
+            let chunk = crate::audio::padded_minimum(samples);
             let transcript = self.run(&chunk, options).context("transcription failed")?;
             let text = transcript.text.trim();
             if !text.is_empty() {
@@ -399,8 +398,7 @@ impl OfflineGgufSession {
                 );
                 continue;
             }
-            let mut chunk = samples.to_vec();
-            crate::audio::pad_minimum(&mut chunk);
+            let chunk = crate::audio::padded_minimum(samples);
             let transcript = self.run(&chunk, options).context("transcription failed")?;
             let text = transcript.text.trim();
             if !text.is_empty() {

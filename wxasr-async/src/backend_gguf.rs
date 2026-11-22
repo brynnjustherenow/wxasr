@@ -1001,7 +1001,13 @@ impl SilenceSource {
                     tracing::warn!(%error, "Silero VAD 失败,静音信号退化为能量门");
                     let mut gate = crate::backend_wxasr::Vad::default();
                     let speech = gate.is_speech(pcm);
-                    let quiet_ms = if speech { 0 } else { ms };
+                    // Carry the silence run the VAD had built: restarting it
+                    // at this chunk would delay a silence rotation already due.
+                    let quiet_ms = if speech {
+                        0
+                    } else {
+                        vad.silence_ms().saturating_add(ms)
+                    };
                     *self = SilenceSource::Energy { gate, quiet_ms };
                     (quiet_ms, speech)
                 }

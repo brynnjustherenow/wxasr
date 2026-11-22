@@ -31,6 +31,18 @@ pub fn pad_minimum(samples: &mut Vec<f32>) {
     );
 }
 
+/// `samples` padded to the 1.5 s minimum, borrowing when already long enough
+/// so full-length chunks of a long clip are never copied.
+pub fn padded_minimum(samples: &[f32]) -> std::borrow::Cow<'_, [f32]> {
+    if samples.len() >= samples_for(MINIMUM_CLIP_DURATION, SAMPLE_RATE) {
+        std::borrow::Cow::Borrowed(samples)
+    } else {
+        let mut owned = samples.to_vec();
+        pad_minimum(&mut owned);
+        std::borrow::Cow::Owned(owned)
+    }
+}
+
 /// Appends 16 kHz mono i16 PCM to `out` as f32 in [-1, 1), the format every
 /// model here takes. Callers feeding i16 convert once, here.
 pub fn i16_to_f32(pcm: &[i16], out: &mut Vec<f32>) {
