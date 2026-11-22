@@ -157,6 +157,17 @@ pub fn assign_speakers(transcript: &mut Transcript, turns: &[SpeakerTurn]) {
 /// The speaker `turns` attribute to `[start_ms, end_ms]`: largest total
 /// overlap wins, `p` breaks exact ties; no overlap, `None`.
 fn speaker_for(start_ms: i64, end_ms: i64, turns: &[SpeakerTurn]) -> Option<u32> {
+    speaker_for_iter(start_ms, end_ms, turns.iter())
+}
+
+/// [`speaker_for`] over any turn sequence, taken in the order given: that
+/// order decides which speaker an exact tie lands on, so a caller passing a
+/// subset passes it in the original order.
+fn speaker_for_iter<'a>(
+    start_ms: i64,
+    end_ms: i64,
+    turns: impl Iterator<Item = &'a SpeakerTurn>,
+) -> Option<u32> {
     // (speaker, total overlap ms, total p); at most `max_speakers` rows.
     let mut totals: Vec<(u32, i64, f32)> = Vec::new();
     for turn in turns {
@@ -225,9 +236,28 @@ pub fn speaker_chunks(len_ms: i64, turns: &[SpeakerTurn], min_piece_ms: i64) -> 
     bounds.sort_unstable();
     bounds.dedup();
 
+    // Sweep instead of rescanning every turn per window: the bounds hold
+    // every turn edge inside the clip, so a turn overlaps window [a, b]
+    // exactly when it covers it (start <= a, end >= b). `active` keeps the
+    // covering turns' indices in input order, which is the order
+    // `speaker_for` breaks exact ties in. O(T log T + W·A), A the overlap
+    // depth, instead of O(W·T).
+    let mut by_start: Vec<usize> = (0..turns.len())
+        .filter(|&index| turns[index].end_ms > turns[index].start_ms)
+        .collect();
+    by_start.sort_by_key(|&index| turns[index].start_ms);
+    let mut next = 0;
+    let mut active: Vec<usize> = Vec::new();
     let mut pieces: Vec<SpeakerChunk> = Vec::new();
     for span in bounds.windows(2) {
-        let speaker = speaker_for(span[0], span[1], turns);
+        while next < by_start.len() && turns[by_start[next]].start_ms <= span[0] {
+            let index = by_start[next];
+            let at = active.partition_point(|&other| other < index);
+            active.insert(at, index);
+            next += 1;
+        }
+        active.retain(|&index| turns[index].end_ms >= span[1]);
+        let speaker = speaker_for_iter(span[0], span[1], active.iter().map(|&index| &turns[index]));
         match pieces.last_mut() {
             Some(piece) if piece.speaker == speaker => piece.end_ms = span[1],
             _ => pieces.push(SpeakerChunk {
@@ -240,23 +270,28 @@ pub fn speaker_chunks(len_ms: i64, turns: &[SpeakerTurn], min_piece_ms: i64) -> 
 
     // A piece too short to stand on its own joins a neighbour, keeping the
     // neighbour's speaker: a blip is the neighbour's flicker more often than
-    // its own turn. Merging only ever extends spans, so this settles.
-    while pieces.len() > 1 {
-        let Some(index) = (0..pieces.len())
-            .find(|&index| pieces[index].end_ms - pieces[index].start_ms < min_piece_ms)
-        else {
-            break;
-        };
-        if index > 0 {
-            let end = pieces[index].end_ms;
-            pieces.remove(index);
-            pieces[index - 1].end_ms = end;
+    // its own turn. Merging only ever extends spans, so one pass settles it:
+    // everything already kept is long enough, a short piece folds into the
+    // last kept one, and a short head carries its start into the next piece
+    // (a lone piece stays whatever its length).
+    let count = pieces.len();
+    let mut kept: Vec<SpeakerChunk> = Vec::with_capacity(count);
+    let mut carry_start: Option<i64> = None;
+    for (index, mut piece) in pieces.into_iter().enumerate() {
+        if let Some(start) = carry_start.take() {
+            piece.start_ms = start;
+        }
+        if piece.end_ms - piece.start_ms >= min_piece_ms {
+            kept.push(piece);
+        } else if let Some(previous) = kept.last_mut() {
+            previous.end_ms = piece.end_ms;
+        } else if index + 1 < count {
+            carry_start = Some(piece.start_ms);
         } else {
-            let start = pieces[0].start_ms;
-            pieces.remove(0);
-            pieces[0].start_ms = start;
+            kept.push(piece);
         }
     }
+    let mut pieces = kept;
     // Merging can make same-speaker pieces adjacent; `dedup_by` passes the
     // pair with `a` as the later element — the one it drops — so the earlier
     // `b` survives by taking the later's end.
@@ -380,8 +415,13 @@ pub fn resplit_mixed_segments(
     {
         // Turns onto the segment's own timeline: a change at a segment edge
         // never lands inside it, so only true straddlers partition.
+        // Only turns overlapping the segment can contribute (the rest add
+        // no bound inside it and no overlap), so the per-segment work scales
+        // with the turns near it, not the whole meeting's: O(S·T) filtering
+        // instead of O(S·T²). Input order is kept, it breaks exact ties.
         let local: Vec<SpeakerTurn> = turns
             .iter()
+            .filter(|turn| turn.end_ms > segment.start_ms && turn.start_ms < segment.end_ms)
             .map(|turn| SpeakerTurn {
                 start_ms: turn.start_ms - segment.start_ms,
                 end_ms: turn.end_ms - segment.start_ms,
@@ -573,6 +613,164 @@ mod tests {
                 speaker: None,
             })
             .collect()
+    }
+
+    /// 旧实现(逐窗口全量扫 turn、逐个找短片合并),作为扫描线版本的对照。
+    fn speaker_chunks_reference(
+        len_ms: i64,
+        turns: &[SpeakerTurn],
+        min_piece_ms: i64,
+    ) -> Vec<SpeakerChunk> {
+        if len_ms <= 0 {
+            return Vec::new();
+        }
+        let mut bounds = vec![0, len_ms];
+        for turn in turns {
+            if turn.end_ms > turn.start_ms {
+                for point in [turn.start_ms, turn.end_ms] {
+                    if point > 0 && point < len_ms {
+                        bounds.push(point);
+                    }
+                }
+            }
+        }
+        bounds.sort_unstable();
+        bounds.dedup();
+        let mut pieces: Vec<SpeakerChunk> = Vec::new();
+        for span in bounds.windows(2) {
+            let speaker = speaker_for(span[0], span[1], turns);
+            match pieces.last_mut() {
+                Some(piece) if piece.speaker == speaker => piece.end_ms = span[1],
+                _ => pieces.push(SpeakerChunk {
+                    start_ms: span[0],
+                    end_ms: span[1],
+                    speaker,
+                }),
+            }
+        }
+        while pieces.len() > 1 {
+            let Some(index) = (0..pieces.len())
+                .find(|&index| pieces[index].end_ms - pieces[index].start_ms < min_piece_ms)
+            else {
+                break;
+            };
+            if index > 0 {
+                let end = pieces[index].end_ms;
+                pieces.remove(index);
+                pieces[index - 1].end_ms = end;
+            } else {
+                let start = pieces[0].start_ms;
+                pieces.remove(0);
+                pieces[0].start_ms = start;
+            }
+        }
+        pieces.dedup_by(|a, b| {
+            if a.speaker == b.speaker {
+                b.end_ms = a.end_ms;
+                true
+            } else {
+                false
+            }
+        });
+        pieces
+    }
+
+    /// 扫描线 + 单遍合并必须与旧实现逐位一致:随机 turn(含越界、退化、
+    /// 重叠、同 p 平手、NaN p)上对拍。
+    #[test]
+    fn speaker_chunks_matches_the_reference_on_random_turns() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |modulo: i64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % modulo as u64) as i64
+        };
+        for case in 0..2_000 {
+            let len_ms = 1 + next(20_000);
+            let count = next(40) as usize;
+            let turns: Vec<SpeakerTurn> = (0..count)
+                .map(|_| {
+                    let start = next(len_ms + 2_000) - 1_000;
+                    SpeakerTurn {
+                        start_ms: start,
+                        end_ms: start + next(4_000) - 200,
+                        speaker: next(4) as u32,
+                        p: match next(5) {
+                            0 => f32::NAN,
+                            1 => 0.5,
+                            _ => next(100) as f32 / 100.0,
+                        },
+                    }
+                })
+                .collect();
+            let min_piece = [0, 1, 600, 5_000][case % 4];
+            assert_eq!(
+                speaker_chunks(len_ms, &turns, min_piece),
+                speaker_chunks_reference(len_ms, &turns, min_piece),
+                "case {case}: len {len_ms}, min {min_piece}, turns {turns:?}"
+            );
+        }
+    }
+
+    /// 只把与段重叠的 turn 投到段内,结果与全量投影一致。
+    #[test]
+    fn segment_local_turns_match_the_full_projection() {
+        let turns = [
+            turn(-500, 200, 1),
+            turn(0, 1_200, 2),
+            turn(1_000, 2_600, 1),
+            turn(2_600, 4_000, 3),
+            turn(9_000, 9_500, 2),
+        ];
+        for (start, end) in [(0, 2_000), (900, 2_700), (2_600, 4_000), (5_000, 6_000)] {
+            let shift = |list: &mut dyn Iterator<Item = &SpeakerTurn>| -> Vec<SpeakerTurn> {
+                list.map(|turn| SpeakerTurn {
+                    start_ms: turn.start_ms - start,
+                    end_ms: turn.end_ms - start,
+                    ..*turn
+                })
+                .collect()
+            };
+            let full = shift(&mut turns.iter());
+            let local = shift(
+                &mut turns
+                    .iter()
+                    .filter(|turn| turn.end_ms > start && turn.start_ms < end),
+            );
+            assert_eq!(
+                speaker_chunks(end - start, &full, MIN_PIECE_MS),
+                speaker_chunks(end - start, &local, MIN_PIECE_MS),
+                "segment {start}-{end}"
+            );
+        }
+    }
+
+    /// NaN p 视为 0,不能压过真实概率赢下平手。
+    #[test]
+    fn a_nan_probability_never_wins_a_tie() {
+        let mut real = turn(0, 500, 1);
+        real.p = 0.1;
+        let mut unset = turn(500, 1_000, 2);
+        unset.p = f32::NAN;
+        let mut transcript = Transcript {
+            segments: segments(&[(0, 1_000)]),
+            ..Transcript::default()
+        };
+        assign_speakers(&mut transcript, &[unset, real]);
+        assert_eq!(transcript.segments[0].speaker, Some(1));
+    }
+
+    /// 无重叠 turn 时保留模型自带的 speaker。
+    #[test]
+    fn a_segment_without_turns_keeps_the_models_speaker() {
+        let mut transcript = Transcript {
+            segments: segments(&[(0, 1_000)]),
+            ..Transcript::default()
+        };
+        transcript.segments[0].speaker = Some(7);
+        assign_speakers(&mut transcript, &[turn(5_000, 6_000, 1)]);
+        assert_eq!(transcript.segments[0].speaker, Some(7));
     }
 
     /// 每段取重叠时长最大的 speaker;平手按 p 加权;无重叠为 None。
