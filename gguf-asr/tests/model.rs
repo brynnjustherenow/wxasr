@@ -309,6 +309,60 @@ fn transcribes_a_speech_wav_end_to_end() {
     );
 }
 
+/// A vocabulary is the model's to use: the engine reports whether it takes
+/// one, and terms never break a run. A glossary of names the clip never says
+/// leaves the transcript's words standing, on a model that takes them as on
+/// one that ignores them.
+#[test]
+fn a_vocabulary_leaves_a_transcript_standing() {
+    let engine = engine_or_skip!();
+    let wav = std::env::var("GGUFASR_WAV").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../wxasr/tests/data/tts_short_1.wav"
+        )
+        .to_string()
+    });
+    if !std::path::Path::new(&wav).is_file() {
+        eprintln!("skipping: {wav} does not exist");
+        return;
+    }
+    let samples = wav_samples(&wav);
+    let transcribe = || {
+        engine
+            .transcribe_clip(samples.clone())
+            .expect("the engine takes the clip")
+            .wait()
+            .expect("the transcription finishes")
+            .text()
+            .to_owned()
+    };
+    let plain = transcribe();
+    let terms = ["Kubernetes", "gRPC", "PostgreSQL"]
+        .iter()
+        .map(|term| term.to_string())
+        .collect();
+    engine.set_vocabulary(terms);
+    let biased = transcribe();
+    println!(
+        "accepts_vocabulary={} plain={plain:?} with_vocabulary={biased:?}",
+        engine.accepts_vocabulary()
+    );
+    let words = |text: &str| {
+        text.split_whitespace()
+            .filter(|word| word.chars().any(|c| c.is_alphanumeric()))
+            .map(|word| word.to_lowercase())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let plain = words(&plain);
+    let kept = plain.intersection(&words(&biased)).count();
+    assert!(
+        plain.is_empty() || kept * 2 >= plain.len(),
+        "at least half of the transcript's words survive a glossary of names"
+    );
+    engine.set_vocabulary(Vec::new());
+}
+
 /// A model without the DIARIZE role is rejected by the library's own truth
 /// (`diarize_info`), not by any gate of ours: the Silero VAD GGUF (1.2 MB,
 /// always cheap to load) has no diarize role. `GGUFASR_VAD_MODEL` overrides

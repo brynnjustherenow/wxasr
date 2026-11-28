@@ -172,6 +172,46 @@ fn builder_chains_capabilities_into_a_working_backend() {
     );
 }
 
+/// 术语表:builder `with_vocabulary` 在会话开启时把术语交给引擎(按模型
+/// 能力适配:支持的模型偏向术语,不支持的忽略并告警,两种都会话照常);
+/// 术语是一份音频里没说到的名字表,会话仍恰出一个 End、有文本。
+#[test]
+fn a_vocabulary_reaches_the_session_without_breaking_it() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let pcm = wav_16k_mono();
+    let plain = recognize(&path, AudioIn::MONO_16K, &pcm);
+    let terms: Vec<String> = ["Kubernetes", "gRPC", "PostgreSQL"]
+        .iter()
+        .map(|term| term.to_string())
+        .collect();
+    let (handle, mut rx) = start_with(
+        Box::new(GgufBackend::new(engine(&path)).with_vocabulary(terms)),
+        Config::default(),
+        AudioIn::MONO_16K,
+    );
+    handle.push(&pcm);
+    handle.finish();
+    let mut finals = Vec::new();
+    while let Some(event) = rx.blocking_recv() {
+        if let AsrEvent::End(text) = event {
+            finals.push(text);
+        }
+    }
+    println!(
+        "accepts_vocabulary={} plain={:?} with_vocabulary={:?}",
+        engine(&path).accepts_vocabulary(),
+        plain.content,
+        finals
+    );
+    assert_eq!(finals.len(), 1, "gguf 会话恰一个 End: {finals:?}");
+    assert!(
+        !finals[0].content.trim().is_empty(),
+        "the session still hears speech"
+    );
+}
+
 /// SAPI 英语 wav(轮换测试的输入;`GGUFASR_WAV` 可覆盖,默认用仓库合成
 /// 副本 `tests/data/sapi_en.wav`,16 kHz 单声道 i16,合成方法见
 /// AGENTS.md)。同名 `.txt` 是参考转写。

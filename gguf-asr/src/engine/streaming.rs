@@ -423,9 +423,9 @@ pub(super) struct FeedStats {
 }
 
 /// Handles commands while stream `id` is open, publishing its text to
-/// `partials` after each feed. Foreground work waits in `deferred` until the
-/// stream ends; background work is skipped; any other command interrupts the
-/// stream.
+/// `partials` after each feed. Foreground work and a vocabulary change wait
+/// in `deferred` until the stream ends; background work is skipped; any other
+/// command interrupts the stream.
 pub(super) fn drive_stream(
     id: u64,
     stream: &mut impl StreamFeed,
@@ -470,6 +470,9 @@ pub(super) fn drive_stream(
             Command::Background { work, .. } => work(None),
             // Nor does foreground work; it runs once the stream ends.
             foreground @ Command::Foreground { .. } => deferred.push_back(foreground),
+            // Nor does a vocabulary change: the stream keeps the terms it
+            // began with, and the change is applied once it ends.
+            vocabulary @ Command::Vocabulary { .. } => deferred.push_back(vocabulary),
             // Nor does a stream that gives way to dictation; it is refused.
             Command::BeginYielding { yielding, .. } => yielding.close(),
             Command::FinishYielding { reply, .. } => {
@@ -505,8 +508,9 @@ pub(super) fn drive_stream(
 
 /// Handles commands while yielding stream `id` is open, publishing its
 /// partial text after each feed. Background work is skipped and foreground
-/// work deferred, as in a dictation stream; any other command (a dictation
-/// begin or finish, shutdown) closes it and is returned.
+/// work and a vocabulary change deferred, as in a dictation stream; any
+/// other command (a dictation begin or finish, shutdown) closes it and is
+/// returned.
 pub(super) fn drive_yielding(
     id: u64,
     stream: &mut impl StreamFeed,
@@ -532,6 +536,7 @@ pub(super) fn drive_yielding(
             Command::Feed { .. } => {}
             Command::Background { work, .. } => work(None),
             foreground @ Command::Foreground { .. } => deferred.push_back(foreground),
+            vocabulary @ Command::Vocabulary { .. } => deferred.push_back(vocabulary),
             Command::Cancel { stream: s } if s == id => return None,
             Command::Cancel { .. } => {}
             Command::FinishYielding { stream: s, reply } if s == id => {

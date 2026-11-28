@@ -29,6 +29,10 @@ impl Engine {
     pub fn streams(&self) -> bool;                                  // 运行时真值(含设备 probe);engine 进 backend 前取好
     pub fn busy(&self) -> bool;
 
+    // ── 术语表(按模型能力适配,不分家族)──────
+    pub fn accepts_vocabulary(&self) -> bool;                       // 模型是否吃自定义术语(加载后读一次,之后不变)
+    pub fn set_vocabulary(&self, terms: Vec<String>);               // 优先级序;此后的整段转写与新建的流生效
+
     // ── 整段转写(f32 16k mono) ─────────────
     pub fn finish(&self, stream: Option<LiveStream>, clip: Vec<f32>) -> Result<PendingTranscript>;
     pub fn finish_with(&self, stream: Option<LiveStream>, clip: Vec<f32>, offline: Offline) -> Result<PendingTranscript>;
@@ -52,6 +56,20 @@ impl Engine {
 `PendingTranscript::wait(self) -> Result<Transcript, String>`;
 `PendingTurns::wait(self) -> Result<Vec<SpeakerTurn>, String>`。
 
+**术语表(vocabulary)**:自定义术语(人名、行话等,优先级序),加载时经
+`ModelSpec::vocabulary`、运行时经 `Engine::set_vocabulary` 设置,进到底层
+每次 run / stream 的 `RunOptions::vocabulary`。**按模型能力适配、不分家族**:
+是否生效以 `Engine::accepts_vocabulary()` 为准(底层 `Feature::Vocabulary`),
+不支持的模型忽略并告警;术语怎么用(当提示词还是重打分)由模型自己决定。
+术语入库时 trim、去空;已开的流保留开始时的术语,变更在该流结束后生效;
+GPU 失败换到 CPU 重载时术语保留;超出 prompt 预算的术语由底层从列表末尾
+丢弃并告警。
+
+**已知差异(是否开启由应用层取舍)**:三个目录家族都自报支持,但效果不同——
+实测一份音频里没说到的名字表,Parakeet / Qwen3-ASR 的转写不变;Whisper 把
+术语当提示词(放进 `<|startofprev|>` 槽的 `Glossary: …`),英文长句会丢
+大部分句末标点,术语与录音开头的词相同时那几个词会被当成"已说过"而吞掉。
+
 - `LiveStream::feed(&mut self, &[f32])` / `take_partial() -> Option<Partial>` /
   `fed() -> usize`(已喂样本)。
 - `Transcript { text, language, segments: Vec<TranscriptSegment>, words }`;
@@ -65,6 +83,7 @@ pub struct ModelSpec {
     pub path: PathBuf,
     pub language: Option<String>,             // None = 自动检测
     pub trailing_silence_samples: usize,      // 16k 采样数,整段尾部补静音
+    pub vocabulary: Vec<String>,             // 自定义术语(优先级序),见上文「术语表」
 }
 impl ModelSpec {
     pub fn new(path) -> Self;                          // language None,0 补静音
@@ -177,6 +196,10 @@ let backend = GgufBackend::new(engine.clone())
     .with_pseudo_streaming(PseudoOptions { vad: Some(SileroVad::load(vad)?), ..Default::default() })
     .with_diarize(DiarizeOptions::default())       // → GgufBackend<HasDiarize>
     .with_speaker_split(SpeakerSplit::Auto);
+// 术语表(任意状态可叠加):每个会话开启时把术语交给引擎,按模型能力生效
+let backend = GgufBackend::new(engine.clone())
+    .with_vocabulary(vec!["Kubernetes".into(), "gRPC".into()])
+    .with_pseudo_streaming(PseudoOptions::default());
 // 其它起点:with_vad(engine, vad) / pseudo_streaming(engine) / with_pseudo(engine, opts)
 //   / from_spec(&spec, device) / from_spec_with_vad(..)
 // 兼容组合构造器:with_pseudo_and_diarize(engine, pseudo, diarize) 亦在 HasDiarize 态

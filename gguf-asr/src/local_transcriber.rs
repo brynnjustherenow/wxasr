@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use eyre::{Context, Result, bail};
-use transcribe_cpp::{Backend, Model, ModelOptions, RunOptions, TimestampKind};
+use transcribe_cpp::{Backend, Feature, Model, ModelOptions, RunOptions, TimestampKind};
 
 use crate::gguf_session::{OfflineGgufSession, output_truncated, resolve_language};
 use crate::gpu_health;
@@ -26,8 +26,8 @@ pub enum Device {
     Cpu,
 }
 
-/// A model this library loads: a GGUF file, its language, and the trailing
-/// silence its clips pad with.
+/// A model this library loads: a GGUF file, its language, the trailing
+/// silence its clips pad with, and the custom terms its runs bias toward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelSpec {
     /// The GGUF file to load.
@@ -39,6 +39,12 @@ pub struct ModelSpec {
     /// model can emit its final word and closing punctuation. Parakeet
     /// Unified English wants 400 ms; see [`ModelSpec::unified_english`].
     pub trailing_silence_samples: usize,
+    /// Custom terms in priority order, such as names and jargon the model
+    /// mishears, that every run and stream biases toward when the model takes
+    /// them ([`LocalTranscriber::accepts_vocabulary`]); a model that does not
+    /// ignores them with a warning. [`LocalTranscriber::set_vocabulary`]
+    /// changes them on a loaded model.
+    pub vocabulary: Vec<String>,
 }
 
 impl ModelSpec {
@@ -48,6 +54,7 @@ impl ModelSpec {
             path: path.into(),
             language: None,
             trailing_silence_samples: 0,
+            vocabulary: Vec::new(),
         }
     }
 
@@ -74,6 +81,8 @@ pub struct LocalTranscriber {
     stream: Option<transcribe_cpp::StreamOptions>,
     /// The finest timestamps the model gives.
     finest_timestamps: TimestampKind,
+    /// Whether the model takes custom terms ([`Self::set_vocabulary`]).
+    accepts_vocabulary: bool,
     /// The GPU it runs on; `None` on the CPU.
     gpu: Option<transcribe_cpp::Device>,
     /// The device choice it loaded for.
@@ -231,6 +240,7 @@ impl LocalTranscriber {
         let architecture = model.arch();
         let capabilities = model.capabilities()?;
         let language = resolve_language(path, spec.language.as_deref(), &capabilities)?;
+        let accepts_vocabulary = model.supports(Feature::Vocabulary);
         let options = RunOptions {
             timestamps: if capabilities.max_timestamp_kind == TimestampKind::None {
                 TimestampKind::None
@@ -238,6 +248,7 @@ impl LocalTranscriber {
                 TimestampKind::Segment
             },
             language,
+            vocabulary: Self::vocabulary(spec, accepts_vocabulary),
             ..Default::default()
         };
         let device_label = format!("{} ({})", device.description, device.kind);
@@ -260,6 +271,7 @@ impl LocalTranscriber {
                 TimestampKind::Word | TimestampKind::Token => TimestampKind::Word,
                 kind => kind,
             },
+            accepts_vocabulary,
             gpu: matches!(
                 device.device_type,
                 transcribe_cpp::DeviceType::Gpu | transcribe_cpp::DeviceType::Igpu
@@ -322,6 +334,43 @@ impl LocalTranscriber {
     /// to merge diarize turns into.
     pub fn finest_timestamps(&self) -> transcribe_cpp::TimestampKind {
         self.finest_timestamps
+    }
+
+    /// Whether the model takes custom terms, so a vocabulary biases its runs
+    /// and streams; one set anyway is dropped with a warning.
+    pub fn accepts_vocabulary(&self) -> bool {
+        self.accepts_vocabulary
+    }
+
+    /// The custom terms, in priority order, that every run and stream
+    /// started from now on biases toward, such as names and jargon the model
+    /// mishears on its own. How a model uses its terms is the model family's
+    /// own: the same list conditions one and rescores another.
+    pub fn set_vocabulary(&mut self, terms: Vec<String>) {
+        self.spec.vocabulary = terms;
+        self.options.vocabulary = Self::vocabulary(&self.spec, self.accepts_vocabulary);
+    }
+
+    /// `spec`'s vocabulary as runs take it: its terms, trimmed and without
+    /// blanks, when the model takes them; none, with a warning, when it does
+    /// not.
+    fn vocabulary(spec: &ModelSpec, accepts: bool) -> Vec<String> {
+        if !accepts {
+            if !spec.vocabulary.is_empty() {
+                tracing::warn!(
+                    terms = spec.vocabulary.len(),
+                    "the model does not take custom terms; ignoring its vocabulary"
+                );
+            }
+            return Vec::new();
+        }
+        spec.vocabulary
+            .iter()
+            .filter_map(|term| {
+                let term = term.trim();
+                (!term.is_empty() && !term.contains('\0')).then(|| term.to_owned())
+            })
+            .collect()
     }
 
     /// Silence a live stream of this model hears before it finalizes, the
@@ -626,5 +675,23 @@ mod tests {
         let plain = ModelSpec::new("model.gguf");
         assert_eq!(plain.language, None);
         assert_eq!(plain.trailing_silence_samples, 0);
+        assert!(plain.vocabulary.is_empty());
+    }
+
+    #[test]
+    fn a_vocabulary_reaches_runs_only_where_the_model_takes_it() {
+        let spec = |terms: &[&str]| ModelSpec {
+            vocabulary: terms.iter().map(|term| term.to_string()).collect(),
+            ..ModelSpec::new("model.gguf")
+        };
+        assert_eq!(
+            LocalTranscriber::vocabulary(&spec(&["  Kubernetes ", "", "g\0RPC"]), true),
+            ["Kubernetes"],
+            "terms are trimmed, and blanks and ones a C string cannot hold are dropped"
+        );
+        assert!(
+            LocalTranscriber::vocabulary(&spec(&["Kubernetes"]), false).is_empty(),
+            "a model without vocabulary support takes none"
+        );
     }
 }

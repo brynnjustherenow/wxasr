@@ -85,10 +85,10 @@ $env:INCLUDE = "C:\VulkanSDK\1.4.363.0\Include;$env:INCLUDE"
   diarize 切分转写的验收测试。
 - 预期基线:wxasr-async lib / integration 全绿(无 feature 19+6;`--features gguf`
   lib 38,含 backend_gguf 的 8 个流式轮换 + 7 个伪流式 + diarize 装配 5 个);
-  gguf-asr lib 123 全绿(121 过 + 2 ignored 属存量;含 gguf_meta 4 个、
-  diarize 22 个:归并 7 + 切分转写 10 + 混合段重切 4 + meta 映射 1);
-  tests/model.rs 10 个(GGUFASR_MODEL/GGUFASR_DIARIZE_MODEL
-  各自门控);gguf_backend 集成测试 6 个(GGUFASR_MODEL 按模型名各自
+  gguf-asr lib 133 全绿(131 过 + 2 ignored 属存量;含 gguf_meta 4 个、
+  diarize 26 个、术语表 4 个);
+  tests/model.rs 13 个(GGUFASR_MODEL/GGUFASR_DIARIZE_MODEL
+  各自门控);gguf_backend 集成测试 7 个(GGUFASR_MODEL 按模型名各自
   激活,其余 skip)。Vulkan 加载大模型要几十秒,timeout 放大。
 - 说话人分离:Sortformer 出 speaker turns,库的归并契约是时间戳;qwen3-asr
   `max_timestamp_kind = NONE`(C++ `finalize_utterance` 恒单段 [0, 整段]),
@@ -158,3 +158,12 @@ $env:INCLUDE = "C:\VulkanSDK\1.4.363.0\Include;$env:INCLUDE"
   段长/RTF(GPU 上 20s 段 ≈1s),`hard_ms` 即段缓冲上界。
 - wxasr-async 的 `gguf` feature 启用 `backend_gguf`(gguf-asr 后端),编译需要
   CMake + Vulkan SDK 环境与 gguf-asr 相同。
+- 术语表(`GgufBackend::with_vocabulary(terms)`,任意状态可叠加,空 = 不用):
+  每个 gguf 会话开启时把术语(优先级序)经 `Engine::set_vocabulary` 交给引擎,
+  进到底层每次 run/stream 的 `RunOptions::vocabulary`。**按模型能力适配、
+  不分家族**:生效与否以 `Engine::accepts_vocabulary()` 为准(底层
+  `Feature::Vocabulary`,加载后读一次),不支持的模型忽略并告警;术语怎么用
+  (提示词 / 重打分)由模型自己决定,wxasr 侧不写任何家族分支。已开的流保留
+  开始时的术语,变更在该流结束后生效(不打断流:`drive_stream`/`drive_yielding`
+  延后处理);GPU 失败换 CPU 重载时术语保留(存在 `ModelSpec.vocabulary`)。
+  入库 trim、去空、去含 NUL 的项(底层是 C 字符串,容不下会让每次 run 报错)。

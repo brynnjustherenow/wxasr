@@ -154,6 +154,11 @@ pub(crate) enum Command {
         pcm: Vec<f32>,
         job: Job,
     },
+    /// Changes the custom terms that runs and streams started from now on
+    /// bias toward. An open live stream keeps its terms until it ends.
+    Vocabulary {
+        terms: Vec<String>,
+    },
     Shutdown,
 }
 
@@ -432,6 +437,10 @@ pub struct Engine {
     /// what [`SpeakerSplit::Auto`] resolves to. Set once at start, from the
     /// model's capability, never mutated after.
     split: SpeakerSplit,
+    /// Whether the loaded model takes custom terms
+    /// ([`Self::set_vocabulary`]). Set once at start, from the model's
+    /// capability, never mutated after.
+    accepts_vocabulary: bool,
     /// Whether dictation streams publish their text as they go.
     live_text: bool,
     /// Whether the worker is running a dictation stream or finish.
@@ -722,6 +731,7 @@ impl Engine {
         let streams = model.stream_options().is_some();
         let streams = Arc::new(AtomicBool::new(streams));
         let diarizes = Arc::new(AtomicBool::new(diarizer.is_some()));
+        let accepts_vocabulary = model.accepts_vocabulary();
         // The runtime truth `SpeakerSplit::Auto` resolves to; the model is
         // moved into the worker below, so read its capability now. The
         // header-only guess for before a load is `gguf_meta` +
@@ -759,6 +769,7 @@ impl Engine {
             streams,
             diarizes,
             split,
+            accepts_vocabulary,
             live_text: true,
             dictating,
             next_stream: AtomicU64::new(0),
@@ -780,6 +791,7 @@ impl Engine {
             streams: Arc::new(AtomicBool::new(true)),
             diarizes: Arc::new(AtomicBool::new(false)),
             split: SpeakerSplit::MixedSegments,
+            accepts_vocabulary: true,
             live_text: true,
             dictating: Arc::default(),
             next_stream: AtomicU64::new(0),
@@ -878,6 +890,23 @@ impl Engine {
     /// Whether the loaded model can stream on its device.
     pub fn streams(&self) -> bool {
         self.streams.load(Ordering::Acquire)
+    }
+
+    /// Whether the loaded model takes custom terms, so a vocabulary set with
+    /// [`Self::set_vocabulary`] biases its runs and streams; one set anyway
+    /// is dropped with a warning.
+    pub fn accepts_vocabulary(&self) -> bool {
+        self.accepts_vocabulary
+    }
+
+    /// The custom terms, in priority order, that every run and stream
+    /// started from now on biases toward: names and jargon the model
+    /// mishears on its own. How a model uses its terms is the model family's
+    /// own: the same list conditions one and rescores another. A stream that
+    /// is already open keeps the terms it began with; the change is applied
+    /// once it ends.
+    pub fn set_vocabulary(&self, terms: Vec<String>) {
+        let _ = self.send(Command::Vocabulary { terms });
     }
 
     /// Whether the engine is running a dictation stream or finish, so
@@ -1292,6 +1321,7 @@ impl Worker {
                 Command::Diarize { pcm, job } => {
                     self.run_diarize(pcm, job);
                 }
+                Command::Vocabulary { terms } => self.model.set_vocabulary(terms),
                 Command::Shutdown => return,
                 // Stale input for a stream that already ended.
                 Command::Feed { .. } | Command::Cancel { .. } => {}
@@ -1631,6 +1661,65 @@ mod tests {
         ));
         drop(deferred);
         assert!(chunk.wait().is_err());
+    }
+
+    #[test]
+    fn a_vocabulary_is_set_by_command() {
+        let (engine, commands) = Engine::for_test();
+        assert!(engine.accepts_vocabulary());
+        engine.set_vocabulary(vec!["Kubernetes".into(), "gRPC".into()]);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Vocabulary { terms } if terms == ["Kubernetes", "gRPC"]
+        ));
+    }
+
+    #[test]
+    fn a_vocabulary_waits_for_an_open_stream_instead_of_interrupting_it() {
+        let (engine, commands) = Engine::for_test();
+        let mut stream = engine.begin().unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Begin { stream: 1, .. }
+        ));
+        stream.feed(&[0.1; 4]);
+        engine.set_vocabulary(vec!["Kubernetes".into()]);
+        stream.feed(&[0.2; 4]);
+        let dictation = engine
+            .finish_with(
+                Some(stream),
+                vec![0.0; 8],
+                Box::new(|_, _| panic!("the dictation must not be retranscribed offline")),
+            )
+            .unwrap();
+
+        let mut fake = FakeStream::default();
+        let mut deferred = VecDeque::new();
+        let ended = drive_stream(
+            1,
+            &mut fake,
+            &commands,
+            &AtomicBool::new(false),
+            None,
+            &mut deferred,
+            &mut FeedStats::default(),
+        );
+        let StreamEnd::Finished { result, job, .. } = ended else {
+            panic!("the vocabulary ended the stream");
+        };
+        assert_eq!(result, Ok("streamed 8".to_string()));
+        assert_eq!(fake.fed.len(), 8);
+        job.finish(Ok(Transcribed {
+            transcript: text_transcript("streamed 8"),
+            source: Source::Stream,
+            finish_ms: 0,
+        }));
+        assert_eq!(dictation.wait().unwrap().source, Source::Stream);
+        // The change waits to be applied until the stream is over.
+        assert!(matches!(
+            deferred.as_slices().0,
+            [Command::Vocabulary { terms }] if terms == &["Kubernetes"]
+        ));
     }
 
     fn tone(samples: usize) -> Vec<f32> {
@@ -2243,6 +2332,30 @@ mod tests {
         ));
         // A closed stream answers at once; its owner transcribes offline.
         assert_eq!(stream.finish(Duration::from_secs(5)), Err(PREEMPTED.into()));
+    }
+
+    #[test]
+    fn a_vocabulary_waits_for_an_open_yielding_stream_instead_of_closing_it() {
+        let (engine, commands) = Engine::for_test();
+        let mut stream = engine.begin_yielding().unwrap();
+        let yielding = begun_yielding(&commands);
+        stream.feed(&[0.1; 4]);
+        engine.set_vocabulary(vec!["Kubernetes".into()]);
+        let _dictation = engine.begin().unwrap();
+        stream.feed(&[0.2; 4]);
+
+        let mut fake = FakeStream::default();
+        let mut deferred = VecDeque::new();
+        let interrupted = drive_yielding(1, &mut fake, &commands, &yielding, &mut deferred);
+        assert!(matches!(
+            interrupted,
+            Some(Command::Begin { stream: 2, .. })
+        ));
+        assert_eq!(fake.fed.len(), 4, "the stream went on until the dictation");
+        assert!(matches!(
+            deferred.as_slices().0,
+            [Command::Vocabulary { terms }] if terms == &["Kubernetes"]
+        ));
     }
 
     #[test]

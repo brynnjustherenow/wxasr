@@ -2,9 +2,9 @@
 //! around every run (and every live stream) so retained scheduler scratch
 //! never outlives the inference that sized it.
 //!
-//! The fork of transcribe.cpp Hex uses adds Parakeet vocabulary biasing and a
-//! context-prompt vocabulary slot; this build stands on the crates.io
-//! release, so no vocabulary is fed to any run.
+//! Custom terms reach every run and stream through the `RunOptions` the
+//! local transcriber hands in ([`crate::local_transcriber`]); this module
+//! decides none of its own.
 
 use std::borrow::Cow;
 use std::cell::RefCell;

@@ -130,6 +130,10 @@ pub struct GgufBackend<S = NoDiarize> {
     /// 定稿的说话人切分策略,默认 `Auto`(按引擎真值:无时间戳模型整段
     /// 切分、有时间戳模型仅混合段重切)。仅 diarize 实际装配时生效。
     split: SpeakerSplit,
+    /// 术语表(优先级序):每个会话开启时交给引擎,该会话的转写与流偏向
+    /// 这些词。按模型能力适配、不分家族——不支持的模型忽略并告警
+    /// (`Engine::accepts_vocabulary`)。空 = 不用术语表。
+    vocabulary: Vec<String>,
     /// builder 状态(typestate),运行期不参与任何行为。
     _state: PhantomData<S>,
 }
@@ -182,6 +186,7 @@ impl GgufBackend<NoDiarize> {
             pseudo: None,
             diarize: None,
             split: SpeakerSplit::Auto,
+            vocabulary: Vec::new(),
             _state: PhantomData,
         }
     }
@@ -195,6 +200,7 @@ impl GgufBackend<NoDiarize> {
             pseudo: None,
             diarize: None,
             split: SpeakerSplit::Auto,
+            vocabulary: Vec::new(),
             _state: PhantomData,
         }
     }
@@ -216,6 +222,7 @@ impl GgufBackend<NoDiarize> {
             pseudo: Some(opts.partial_every_ms),
             diarize: None,
             split: SpeakerSplit::Auto,
+            vocabulary: Vec::new(),
             _state: PhantomData,
         }
     }
@@ -228,6 +235,7 @@ impl GgufBackend<NoDiarize> {
             pseudo: None,
             diarize: None,
             split: SpeakerSplit::Auto,
+            vocabulary: Vec::new(),
             _state: PhantomData,
         })
     }
@@ -244,6 +252,7 @@ impl GgufBackend<NoDiarize> {
             pseudo: None,
             diarize: None,
             split: SpeakerSplit::Auto,
+            vocabulary: Vec::new(),
             _state: PhantomData,
         })
     }
@@ -261,6 +270,16 @@ impl<S> GgufBackend<S> {
         self
     }
 
+    /// 术语表(任意状态可叠加):每个会话开启时把 `terms`(优先级序,
+    /// 如人名、行话)交给引擎,该会话的转写偏向这些词。按模型能力适配、
+    /// 不分家族:怎么用术语由模型自己决定(有的当提示词、有的重打分),
+    /// 不支持的模型忽略并告警(`Engine::accepts_vocabulary`)。空列表 =
+    /// 不用术语表。
+    pub fn with_vocabulary(mut self, terms: Vec<String>) -> Self {
+        self.vocabulary = terms;
+        self
+    }
+
     /// 说话人分离(进入 [`HasDiarize`] 状态,`with_speaker_split` 从此
     /// 可达):定稿时对滚动窗口跑 diarize、归并 speaker。引擎须以
     /// `Engine::load_with_diarize` 带独立 diarize 模型加载;未带则装配
@@ -272,6 +291,7 @@ impl<S> GgufBackend<S> {
             pseudo,
             diarize: _,
             split,
+            vocabulary,
             _state,
         } = self;
         GgufBackend {
@@ -280,6 +300,7 @@ impl<S> GgufBackend<S> {
             pseudo,
             diarize: Some(opts),
             split,
+            vocabulary,
             _state: PhantomData,
         }
     }
@@ -312,6 +333,7 @@ impl GgufBackend<HasDiarize> {
             pseudo: Some(opts.partial_every_ms),
             diarize: Some(diarize),
             split: SpeakerSplit::Auto,
+            vocabulary: Vec::new(),
             _state: PhantomData,
         }
     }
@@ -429,6 +451,9 @@ fn transcribe_segment(
 
 impl<S: Send + Sync> AsrBackend for GgufBackend<S> {
     fn open(&self, cfg: &Config, audio: AudioIn) -> eyre::Result<Box<dyn AsrSession>> {
+        // 术语表先于本会话的流/转写命令入队(同一命令通道,按序生效);
+        // 空列表同样下发,清掉上一个会话留在引擎里的术语。
+        self.engine.set_vocabulary(self.vocabulary.clone());
         // gguf-asr 的会话吃 16 kHz 单声道 i16:调用方声明的格式在这里转换,
         // 16 kHz 单声道直通。
         let convert = InputConverter::new(audio)
